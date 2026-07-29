@@ -1,0 +1,48 @@
+/** Convert common Markdown emitted by models into readable IM plain text. */
+export function toChatPlainText(value: string): string {
+  let text = value.replace(/\r\n?/gu, "\n");
+  const escapedMarkup: string[] = [];
+  text = text.replace(/\\([\\`*_[\]{}()#+.!>-])/gu, (_match, character: string) => {
+    const index = escapedMarkup.push(character) - 1;
+    return `\uE000${index}\uE001`;
+  });
+
+  text = text.replace(/^[ \t]*```[^\n]*\n?/gmu, "").replace(/^[ \t]*```[ \t]*$/gmu, "");
+  text = text
+    .replace(/!\[([^\]]*)\]\((\S+?)(?:\s+["'][^"']*["'])?\)/gu, (_match, label: string, url: string) =>
+      `${label.trim() || "图片"}：${url}`)
+    .replace(/\[([^\]]+)\]\((\S+?)(?:\s+["'][^"']*["'])?\)/gu, (_match, label: string, url: string) => {
+      const title = label.trim();
+      return title === url ? url : `${title}：${url}`;
+    })
+    .replace(/<((?:https?:\/\/|mailto:)[^>]+)>/giu, "$1")
+    .replace(/^\s{0,3}#{1,6}\s+/gmu, "")
+    .replace(/^\s{0,3}>\s?/gmu, "")
+    .replace(/^[ \t]*[-*+][ \t]+\[x\][ \t]+/gimu, "☑ ")
+    .replace(/^[ \t]*[-*+][ \t]+\[[ \t]\][ \t]+/gmu, "☐ ")
+    .replace(/^[ \t]*[-*+][ \t]+/gmu, "• ")
+    .replace(/^[ \t]*(\d{1,3})[.)][ \t]+/gmu, "$1、")
+    .replace(/^[ \t]*(?:-{3,}|_{3,}|\*{3,})[ \t]*$/gmu, "")
+    .replace(/~~([^\n~]+)~~/gu, "$1")
+    .replace(/\*\*([^\n*]+)\*\*/gu, "$1")
+    .replace(/__([^\n_]+)__/gu, "$1")
+    .replace(/(?<!\*)\*([^\n*]+)\*(?!\*)/gu, "$1")
+    .replace(/(?<!_)_([^\n_]+)_(?!_)/gu, "$1")
+    .replace(/`([^`\n]+)`/gu, "$1");
+
+  const plainLines: string[] = [];
+  for (const line of text.split("\n")) {
+    if (/^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*$/u.test(line)) continue;
+    if (/^\s*\|.*\|\s*$/u.test(line)) {
+      const cells = line.trim().replace(/^\||\|$/gu, "").split("|").map((cell) => cell.trim()).filter(Boolean);
+      plainLines.push(cells.join(" · "));
+    } else {
+      plainLines.push(line.replace(/[ \t]+$/gu, ""));
+    }
+  }
+  return plainLines
+    .join("\n")
+    .replace(/\n{3,}/gu, "\n\n")
+    .trim()
+    .replace(/\uE000(\d+)\uE001/gu, (_match, index: string) => escapedMarkup[Number(index)] ?? "");
+}

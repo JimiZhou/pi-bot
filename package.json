@@ -1,0 +1,63 @@
+{
+  "name": "pi-bot",
+  "version": "0.2.0",
+  "description": "A transport-independent, persistent, multimodal Pi-powered bot core",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./channel": {
+      "types": "./dist/channel.d.ts",
+      "import": "./dist/channel.js"
+    },
+    "./adapter": {
+      "types": "./dist/channel-adapter.d.ts",
+      "import": "./dist/channel-adapter.js"
+    },
+    "./media": {
+      "types": "./dist/media.d.ts",
+      "import": "./dist/media.js"
+    },
+    "./plugins": {
+      "types": "./dist/plugins/index.d.ts",
+      "import": "./dist/plugins/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "docs"
+  ],
+  "workspaces": [
+    "webui"
+  ],
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "TSX_DISABLE_CACHE=1 node --import tsx --test test/*.test.ts",
+    "check": "npm run typecheck && npm test && npm run build && npm run webui:check",
+    "webui:dev": "npm run dev --workspace pi-bot-console --",
+    "webui:build": "npm run build --workspace pi-bot-console",
+    "webui:check": "npm run check --workspace pi-bot-console",
+    "prepack": "npm run build"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.74.2",
+    "@earendil-works/pi-ai": "0.74.2",
+    "@modelcontextprotocol/sdk": "^1.30.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.3.0",
+    "tsx": "4.20.5",
+    "typescript": "5.9.2"
+  },
+  "license": "MIT"
+}
