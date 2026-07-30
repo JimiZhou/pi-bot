@@ -123,7 +123,12 @@ export {
   type EmojiToolOptions,
 } from "./emoji-library.js";
 export { SharedConversationState, fusedMessageId } from "./shared-conversation-state.js";
-export { canonicalIdentity, replaceTransportIds, safeGroupDisplayName } from "./display-name.js";
+export {
+  canonicalIdentity,
+  replaceTransportIds,
+  replaceWechatIds,
+  safeGroupDisplayName,
+} from "./display-name.js";
 export {
   nextScheduledTaskRun,
   scheduledTaskMinute,
@@ -225,3 +230,50 @@ export type {
   TriggerDecision,
   TriggerPolicy,
 } from "./types.js";
+
+// Private deployment compatibility layer recovered from the production image.
+export { toWechatPlainText } from "./wechat-text.js";
+export {
+  WechatIpadApiClient,
+  WechatIpadApiError,
+  createWechatIpadChannel,
+  isWechatIpadSessionInvalidError,
+  isWechatIpadCallbackSourceAllowed,
+  normalizeWechatIpadMessage,
+  parseWechatIpadSyncEnvelope,
+  wechatIpadSilkBitrateForPcmBytes,
+  wechatIpadCallbackMessages,
+  wechatIpadCallbackGroupContactChanges,
+} from "./adapters/wechat-ipad.js";
+export {
+  WxHookGatewayClient,
+  WxHookGatewayError,
+  createWxHookHttpChannel,
+  normalizeWxHookMessage,
+  verifyWxHookWebhookSignature,
+} from "./adapters/wx-hook-http.js";
+export {
+  createWechatAdapterRegistry,
+  wechatIpadAdapter,
+  wxHookHttpAdapter,
+} from "./adapters/definitions.js";
+export {
+  AdminStore,
+  AdminServer,
+  probeProvider,
+  AgentSupervisor,
+  WechatIpadLoginManager,
+} from "./admin/index.js";
+export {
+  DEFAULT_BOT_LIMITS,
+  DEFAULT_GLOBAL_SETTINGS,
+  DEFAULT_PERSONA_PROFILE,
+  DEFAULT_SOCIAL_SCHEDULE,
+  parseBotConfig,
+  parseGlobalSettings,
+  parseKnowledgeProviderProfile,
+  parseMcpServerProfile,
+  parseModelProfile,
+  parsePersonaProfile,
+  parseProviderProfile,
+} from "./admin/config.js";

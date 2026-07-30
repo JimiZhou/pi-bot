@@ -1,0 +1,45 @@
+services:
+  pi-wechat-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.recovered
+    image: pi-wechat-agent-recovered:20260729
+    init: true
+    restart: unless-stopped
+    user: "${PI_UID:-1026}:${PI_GID:-100}"
+    environment:
+      NODE_ENV: production
+      PI_AGENT_DATA_DIR: /app/data
+      PI_WEBUI_HOST: 0.0.0.0
+      PI_WEBUI_PORT: 8787
+      PI_WEBUI_ALLOW_PUBLIC: "${PI_WEBUI_ALLOW_PUBLIC:-false}"
+      PI_FALLBACK_NOTIFY_USER: "${PI_FALLBACK_NOTIFY_USER:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      GOOGLE_GENERATIVE_AI_API_KEY: "${GOOGLE_GENERATIVE_AI_API_KEY:-}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      WX_HOOK_API_TOKEN: "${WX_HOOK_API_TOKEN:-}"
+      WX_HOOK_WEBHOOK_SECRET: "${WX_HOOK_WEBHOOK_SECRET:-}"
+      PI_TTS_API_BASE_URL: "${PI_TTS_API_BASE_URL:-http://tts-api:8880}"
+      PI_TTS_API_KEY: "${PI_TTS_API_KEY:-}"
+      PI_TTS_API_EDGE_VOICE: "${PI_TTS_API_EDGE_VOICE:-zh-CN-XiaoxiaoNeural}"
+      PI_TTS_API_KOKORO_VOICE: "${PI_TTS_API_KOKORO_VOICE:-zf_xiaoxiao}"
+      PI_TTS_API_SPEED: "${PI_TTS_API_SPEED:-1}"
+      PI_GEMINI_TTS_ENABLED: "${PI_GEMINI_TTS_ENABLED:-true}"
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "${PI_LAN_IP:-127.0.0.1}:8787:8787"
+      - "${PI_LAN_IP:-127.0.0.1}:9000-9099:9000-9099"
+    networks:
+      - default
+      - google-ai-studio
+      - wechatreal08
+
+networks:
+  google-ai-studio:
+    external: true
+    name: google-ai-studio-2api_default
+  wechatreal08:
+    external: true
+    name: wechatreal08_default

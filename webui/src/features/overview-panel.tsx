@@ -64,8 +64,8 @@ export function OverviewPanel({ snapshot }: { snapshot: ConsoleSnapshot }) {
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1.6fr)_minmax(19rem,1fr)]">
         <Card className="shadow-none">
           <CardHeader>
-            <CardTitle>消息处理量</CardTitle>
-            <CardDescription>过去 24 小时，共处理 27,648 个入站与出站事件</CardDescription>
+            <CardTitle>Bot 入站负载</CardTitle>
+            <CardDescription>当前进程启动以来，各 Bot 接收的消息量对比</CardDescription>
             <CardAction>
               <StatusPill label="实时" tone="neutral" />
             </CardAction>
@@ -76,7 +76,7 @@ export function OverviewPanel({ snapshot }: { snapshot: ConsoleSnapshot }) {
                 <div
                   key={`${index}-${value}`}
                   className="group relative flex h-full min-w-0 flex-1 items-end"
-                  title={`${index}:00 · ${value * 4} 个事件`}
+                  title={`${snapshot.volumeLabels?.[index] ?? `Bot ${index + 1}`} · ${snapshot.volumeCounts?.[index] ?? value} 条`}
                 >
                   <div
                     className="w-full rounded-t-sm bg-indigo-200 transition-colors group-hover:bg-indigo-500 dark:bg-indigo-900 dark:group-hover:bg-indigo-500"
@@ -85,12 +85,12 @@ export function OverviewPanel({ snapshot }: { snapshot: ConsoleSnapshot }) {
                 </div>
               ))}
             </div>
-            <div className="mt-3 flex items-center justify-between text-xs text-muted-foreground">
-              <span>00:00</span>
-              <span>06:00</span>
-              <span>12:00</span>
-              <span>18:00</span>
-              <span>现在</span>
+            <div className="mt-3 flex items-center justify-around gap-2 text-xs text-muted-foreground">
+              {snapshot.volumeLabels?.map((label, index) => (
+                <span key={label} className="truncate" title={label}>
+                  {label} · {(snapshot.volumeCounts?.[index] ?? 0).toLocaleString()}
+                </span>
+              ))}
             </div>
           </CardContent>
         </Card>
@@ -100,7 +100,7 @@ export function OverviewPanel({ snapshot }: { snapshot: ConsoleSnapshot }) {
             <CardTitle>系统健康</CardTitle>
             <CardDescription>核心依赖与处理链路</CardDescription>
             <CardAction>
-              <StatusPill label="3 正常" />
+              <StatusPill label={`${snapshot.checks.filter((check) => check.status === "正常").length} 正常`} />
             </CardAction>
           </CardHeader>
           <CardContent className="space-y-1">
@@ -139,7 +139,7 @@ export function OverviewPanel({ snapshot }: { snapshot: ConsoleSnapshot }) {
         <Card className="shadow-none">
           <CardHeader>
             <CardTitle>处理链路</CardTitle>
-            <CardDescription>平台中性的标准消息流</CardDescription>
+            <CardDescription>平台无关 Core + 标准 WeChat Adapter</CardDescription>
           </CardHeader>
           <CardContent>
             <div className="space-y-1">
@@ -214,8 +214,8 @@ export function OverviewPanel({ snapshot }: { snapshot: ConsoleSnapshot }) {
       <Card className="border-indigo-200 bg-indigo-50/50 shadow-none dark:border-indigo-900 dark:bg-indigo-950/20">
         <CardContent className="flex flex-col gap-4 p-4 sm:flex-row sm:items-center sm:justify-between sm:p-5">
           <div>
-            <p className="font-medium">存储空间使用 {snapshot.runtime.storageUsage}%</p>
-            <p className="mt-1 text-xs text-muted-foreground">{snapshot.runtime.storageLabel} · 会话与媒体资源</p>
+            <p className="font-medium">运行时 Heap 使用 {snapshot.runtime.storageUsage}%</p>
+            <p className="mt-1 text-xs text-muted-foreground">{snapshot.runtime.storageLabel}</p>
           </div>
           <div className="w-full sm:w-64">
             <Progress value={snapshot.runtime.storageUsage} aria-label="存储空间使用率" />

@@ -77,6 +77,8 @@ export interface EmojiCollectorOptions {
   visionProvider?: ImageUnderstandingProvider;
   maxImageBytes: number;
   timeoutMs: number;
+  /** Adapter hook for preserving replay metadata on the normalized local asset. */
+  normalizeAsset?: (storedAsset: AssetRef, sourceAsset: AssetRef) => AssetRef;
   log?: (level: "info" | "warn" | "error", event: string, message: string, details?: Readonly<Record<string, unknown>>) => void;
 }
 
@@ -109,7 +111,7 @@ export async function collectInboundEmoji(event: InboundMessageEvent, options: E
       sourceSenderId: event.sender.id,
     },
   });
-  const localAsset = storedAsset;
+  const localAsset = options.normalizeAsset?.(storedAsset, part.asset) ?? storedAsset;
   if (!localAsset.sha256) throw new Error("Collected emoji asset has no SHA-256 digest");
   const saved = options.store.saveCollectedEmoji({
     botId: options.botId,

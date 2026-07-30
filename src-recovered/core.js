@@ -1,0 +1,1590 @@
+import { KeyedQueue } from "./keyed-queue.js";
+import { createAttachmentInspectionTool } from "./attachment-inspection.js";
+import { createImageUnderstandingTool, } from "./image-understanding.js";
+import { renderMessageParts, textPart, validateMessageParts } from "./message-parts.js";
+import { buildSystemPrompt, buildTurnPrompt, DEFAULT_SOUL, shouldAutoLookupKnowledge } from "./prompt.js";
+import { SqliteStore } from "./sqlite-store.js";
+import { SharedConversationState } from "./shared-conversation-state.js";
+import { replaceWechatIds, safeGroupDisplayName } from "./display-name.js";
+import { emojiToolRecommendation } from "./emoji-library.js";
+import { preferredVoiceReplyMode, WHISPER_TTS_STYLE } from "./reply-modality.js";
+import { createCoreTools } from "./tools.js";
+import { SocialTriggerPolicy } from "./trigger.js";
+import { extractSearchTerms } from "./search-terms.js";
+import { toWechatPlainText } from "./wechat-text.js";
+const PARTICIPATION_INTENSITY = {
+    conservative: { threshold: 0.85, initialBackoffMs: 45_000 },
+    standard: { threshold: 0.75, initialBackoffMs: 20_000 },
+    active: { threshold: 0.62, initialBackoffMs: 8_000 },
+};
+export class GroupAgentCore {
+    #bot;
+    #botIdentityResolver;
+    #runner;
+    #runnerResolver;
+    #participationJudgeRunner;
+    #emojiBattleRunner;
+    #identityAliasesResolver;
+    #sharedConversationState;
+    #sessionNamespace;
+    #sessionKeyResolver;
+    #store;
+    #queue = new KeyedQueue();
+    #triggerPolicy;
+    #baseSoul;
+    #soulResolver;
+    #defaultActivation;
+    #historyLimit;
+    #maxHistoryChars;
+    #memoryLimit;
+    #behaviorLimit;
+    #continuationWindowMs;
+    #maxReplyChars;
+    #maxAgentLlmCalls;
+    #maxAgentToolCalls;
+    #agentTimeoutMs;
+    #maxKnowledgeChars;
+    #knowledgeRetriever;
+    #operatorIds;
+    #onTrace;
+    #toolProviders;
+    #imageUnderstandingProvider;
+    #imageUnderstandingProviderResolver;
+    #maxImageUnderstandingCalls;
+    #maxImageBytes;
+    #maxImageEvidenceChars;
+    #imageUnderstandingTimeoutMs;
+    #imageContextMessageLimit;
+    #imageContextWindowMs;
+    #maxAvailableImagesPerTurn;
+    #socialSchedule;
+    #proactiveGate;
+    #autoParticipationGate;
+    #participationIntensityResolver;
+    #responseGate;
+    #responseGateRelease;
+    #memoryEmbeddingProvider;
+    #pendingFeedback;
+    #voiceModeResolver;
+    /** Per-conversation judge throttle: negative verdicts back off exponentially. */
+    #judgeState = new Map();
+    /** Query-embedding LRU keyed by model + normalized query text. */
+    #queryEmbeddingCache = new Map();
+    #closed = false;
+    constructor(options) {
+        assertIdentity(options.bot);
+        this.#bot = options.bot;
+        this.#botIdentityResolver = options.botIdentityResolver;
+        this.#runner = options.runner;
+        this.#runnerResolver = options.runnerResolver;
+        this.#participationJudgeRunner = options.participationJudgeRunner;
+        this.#emojiBattleRunner = options.emojiBattleRunner;
+        this.#identityAliasesResolver = options.identityAliasesResolver;
+        this.#sharedConversationState = options.sharedConversationState;
+        this.#sessionNamespace = options.sessionNamespace ?? options.bot.id;
+        this.#sessionKeyResolver = options.sessionKeyResolver;
+        this.#store = new SqliteStore(options.databasePath ?? "./data/pi-wechat-agent.sqlite");
+        this.#triggerPolicy = options.triggerPolicy ?? new SocialTriggerPolicy();
+        this.#baseSoul = options.soul ?? DEFAULT_SOUL;
+        this.#soulResolver = options.soulResolver;
+        this.#defaultActivation = options.defaultGroupActivation ?? "mention";
+        this.#historyLimit = boundedInteger(options.historyLimit ?? 50, 1, 500, "historyLimit");
+        this.#maxHistoryChars = boundedInteger(options.maxHistoryChars ?? 12_000, 1_000, 200_000, "maxHistoryChars");
+        this.#memoryLimit = boundedInteger(options.memoryLimit ?? 12, 0, 100, "memoryLimit");
+        this.#behaviorLimit = boundedInteger(options.behaviorLimit ?? 12, 0, 100, "behaviorLimit");
+        this.#continuationWindowMs = boundedInteger(options.continuationWindowMs ?? 5 * 60 * 1000, 0, 24 * 60 * 60 * 1000, "continuationWindowMs");
+        this.#maxReplyChars = boundedInteger(options.maxReplyChars ?? 2000, 100, 100_000, "maxReplyChars");
+        this.#maxAgentLlmCalls = boundedInteger(options.maxAgentLlmCalls ?? 6, 1, 30, "maxAgentLlmCalls");
+        this.#maxAgentToolCalls = boundedInteger(options.maxAgentToolCalls ?? 8, 0, 50, "maxAgentToolCalls");
+        this.#agentTimeoutMs = boundedInteger(options.agentTimeoutMs ?? 120_000, 5_000, 10 * 60_000, "agentTimeoutMs");
+        this.#maxKnowledgeChars = boundedInteger(options.maxKnowledgeChars ?? 6000, 500, 100_000, "maxKnowledgeChars");
+        this.#knowledgeRetriever = options.knowledgeRetriever;
+        this.#operatorIds = new Set(options.operatorIds ?? []);
+        this.#onTrace = options.onTrace;
+        this.#toolProviders = [...(options.toolProviders ?? [])];
+        this.#imageUnderstandingProvider = options.imageUnderstandingProvider;
+        this.#imageUnderstandingProviderResolver = options.imageUnderstandingProviderResolver;
+        this.#maxImageUnderstandingCalls = boundedInteger(options.maxImageUnderstandingCalls ?? 2, 1, 10, "maxImageUnderstandingCalls");
+        this.#maxImageBytes = boundedInteger(options.maxImageBytes ?? 10 * 1024 * 1024, 1, 100 * 1024 * 1024, "maxImageBytes");
+        this.#maxImageEvidenceChars = boundedInteger(options.maxImageEvidenceChars ?? 4000, 100, 50_000, "maxImageEvidenceChars");
+        this.#imageUnderstandingTimeoutMs = boundedInteger(options.imageUnderstandingTimeoutMs ?? 45_000, 1, 10 * 60_000, "imageUnderstandingTimeoutMs");
+        this.#imageContextMessageLimit = boundedInteger(options.imageContextMessageLimit ?? 8, 0, 50, "imageContextMessageLimit");
+        this.#imageContextWindowMs = boundedInteger(options.imageContextWindowMs ?? 10 * 60_000, 0, 24 * 60 * 60_000, "imageContextWindowMs");
+        this.#maxAvailableImagesPerTurn = boundedInteger(options.maxAvailableImagesPerTurn ?? 4, 1, 20, "maxAvailableImagesPerTurn");
+        this.#socialSchedule = options.socialSchedule;
+        this.#proactiveGate = options.proactiveGate;
+        this.#autoParticipationGate = options.autoParticipationGate;
+        this.#participationIntensityResolver = options.participationIntensityResolver;
+        this.#responseGate = options.responseGate;
+        this.#responseGateRelease = options.responseGateRelease;
+        this.#memoryEmbeddingProvider = options.memoryEmbeddingProvider;
+        this.#pendingFeedback = options.pendingFeedback;
+        this.#voiceModeResolver = options.voiceModeResolver;
+    }
+    async receive(event, context = {}) {
+        this.#assertOpen();
+        validateEvent(event);
+        return this.#queue.run(event.conversation.id, () => this.#handle(event, context));
+    }
+    async receiveDirect(event, text, reason, parts = []) {
+        this.#assertOpen();
+        validateEvent(event);
+        const normalized = cleanReply(text, this.#maxReplyChars);
+        const normalizedParts = parts.map((part) => part.type === "text" ? { ...part, text: cleanReply(part.text, this.#maxReplyChars) ?? "" } : part).filter((part) => part.type !== "text" || part.text.length > 0);
+        validateMessageParts(normalizedParts);
+        if (!normalized && normalizedParts.length === 0)
+            throw new Error("Direct plugin reply cannot be empty");
+        const normalizedReason = reason.normalize("NFKC").trim();
+        if (!/^[a-zA-Z0-9._:-]{1,100}$/.test(normalizedReason))
+            throw new Error("Direct plugin reply reason is invalid");
+        return this.#queue.run(event.conversation.id, () => this.#handleDirect(event, normalized ?? "", normalizedReason, normalizedParts));
+    }
+    async receiveWithPrompt(event, prompt, reason) {
+        this.#assertOpen();
+        validateEvent(event);
+        const normalizedPrompt = prompt.normalize("NFKC").trim();
+        if (!normalizedPrompt)
+            throw new Error("Plugin agent prompt cannot be empty");
+        const normalizedReason = reason.normalize("NFKC").trim();
+        if (!/^[a-zA-Z0-9._:-]{1,100}$/.test(normalizedReason))
+            throw new Error("Plugin agent prompt reason is invalid");
+        return this.#queue.run(event.conversation.id, () => this.#handleWithPrompt(event, normalizedPrompt, normalizedReason));
+    }
+    async receiveIgnored(event, reason) {
+        this.#assertOpen();
+        validateEvent(event);
+        const normalizedReason = reason.normalize("NFKC").trim();
+        if (!/^[a-zA-Z0-9._:-]{1,100}$/.test(normalizedReason))
+            throw new Error("Ignored event reason is invalid");
+        return this.#queue.run(event.conversation.id, () => this.#handleIgnored(event, normalizedReason));
+    }
+    setGroupActivation(conversationId, activation) {
+        this.#assertOpen();
+        if (!conversationId.trim())
+            throw new Error("conversationId cannot be empty");
+        this.#store.setGroupActivation(conversationId, activation);
+    }
+    pendingOutbox(limit = 100) {
+        this.#assertOpen();
+        return this.#store.pendingOutbox(boundedInteger(limit, 1, 10_000, "limit"));
+    }
+    /** True once this Core has durably ingested the native event id. */
+    hasSeenEvent(eventId) {
+        this.#assertOpen();
+        if (!eventId.trim())
+            return false;
+        return this.#store.hasSeenEvent(eventId);
+    }
+    acknowledgeOutbox(actionIds) {
+        this.#assertOpen();
+        this.#store.acknowledgeOutbox(actionIds);
+        this.#trace({ type: "outbox.acked", actionIds: [...actionIds] });
+    }
+    remember(input) {
+        this.#assertOpen();
+        const memory = this.#store.remember(input);
+        this.#trace({ type: "memory.saved", memoryId: memory.id, scope: memory.scope, scopeId: memory.scopeId });
+        return memory;
+    }
+    listLearningAudit(conversationId, limit = 100) {
+        this.#assertOpen();
+        if (!conversationId.trim())
+            throw new Error("conversationId cannot be empty");
+        return this.#store.listLearningAudit(conversationId, boundedInteger(limit, 1, 10_000, "limit"));
+    }
+    listParticipationCases(query = {}) {
+        this.#assertOpen();
+        return this.#store.listParticipationCases(query);
+    }
+    participationSummary() {
+        this.#assertOpen();
+        return this.#store.participationSummary();
+    }
+    labelParticipationCase(eventId, label, reason) {
+        this.#assertOpen();
+        return this.#store.labelParticipationCase(eventId, label, reason);
+    }
+    labelReplyQualityCase(eventId, label, reason) {
+        this.#assertOpen();
+        return this.#store.labelReplyQualityCase(eventId, label, reason);
+    }
+    pruneParticipationCases(retentionDays, maxCases) {
+        this.#assertOpen();
+        return this.#store.pruneParticipationCases(retentionDays, maxCases);
+    }
+    listGroupActivity(startAt, endAt, minInboundMessages = 1) {
+        this.#assertOpen();
+        return this.#store.listGroupActivity(startAt, endAt, minInboundMessages).filter((group) => (this.#store.getGroupActivation(group.conversationId) ?? this.#defaultActivation) === "always");
+    }
+    listConversationMessages(conversationId, options = {}) {
+        this.#assertOpen();
+        return this.#store.listConversationMessages(conversationId, options);
+    }
+    inboundImages(eventId) {
+        this.#assertOpen();
+        if (!eventId.trim())
+            throw new Error("eventId cannot be empty");
+        return this.#store.getInboundImages(eventId);
+    }
+    resetConversationContext(conversationId, actorId, sourceEventId) {
+        this.#assertOpen();
+        const local = this.#store.resetConversationContext(conversationId, actorId, sourceEventId);
+        if (!isWechatGroupConversationId(conversationId))
+            return local;
+        return this.#sharedConversationState?.resetContext(conversationId, actorId, sourceEventId) ?? local;
+    }
+    conversationContextReset(conversationId) {
+        this.#assertOpen();
+        if (!isWechatGroupConversationId(conversationId)) {
+            return this.#store.getConversationContextReset(conversationId);
+        }
+        return this.#sharedConversationState?.contextReset(conversationId) ??
+            this.#store.getConversationContextReset(conversationId);
+    }
+    listColdGroups(cutoffAt, earliestAt, limit = 20) {
+        this.#assertOpen();
+        return this.#store.listColdGroups(cutoffAt, earliestAt, limit).filter((group) => (this.#store.getGroupActivation(group.conversationId) ?? this.#defaultActivation) === "always");
+    }
+    getGroupActivityDigest(conversationId, startAt, endAt) {
+        this.#assertOpen();
+        return this.#store.getGroupActivityDigest(conversationId, startAt, endAt);
+    }
+    async participate(request) {
+        this.#assertOpen();
+        if (!request.id.trim() || !request.conversationId.trim() || !request.prompt.trim()) {
+            throw new Error("Proactive participation requires id, conversationId, and prompt");
+        }
+        return this.#queue.run(request.conversationId, () => this.#handleProactive(request));
+    }
+    async sendProactiveText(request, text) {
+        return this.sendProactiveMessage(request, text);
+    }
+    async sendProactiveMessage(request, text, parts = []) {
+        this.#assertOpen();
+        validateMessageParts(parts);
+        const normalized = text.trim() ? cleanReply(text, this.#maxReplyChars) ?? "" : "";
+        if (!normalized && parts.length === 0)
+            throw new Error("Proactive message cannot be empty");
+        const outboundParts = parts.length > 0 ? [...parts] : [textPart(normalized)];
+        const participationSummary = normalized || renderMessageParts(outboundParts, true).join("\n");
+        return this.#queue.run(request.conversationId, async () => {
+            const recent = this.#recent(request.conversationId);
+            const prepared = this.#store.beginProactiveEvent(request, this.#bot.id, recent);
+            if (!prepared.inserted) {
+                const completed = this.#store.getOutcome(request.id, true);
+                if (completed)
+                    return completed;
+            }
+            if (!this.#store.claimProcessing(request.id, `proactive-${request.kind}`)) {
+                const completed = this.#store.getOutcome(request.id, true);
+                if (completed)
+                    return completed;
+                throw new Error(`Proactive event ${request.id} is already being processed`);
+            }
+            this.#store.completeParticipationCase(request.id, "replied", participationSummary);
+            return this.#completeWithReply(prepared.event, normalized, outboundParts, `proactive-${request.kind}`);
+        });
+    }
+    #recentBefore(event) {
+        if (event.conversation.kind === "group" && this.#sharedConversationState) {
+            return this.#sharedConversationState.recentBefore(event, this.#historyLimit, this.#bot);
+        }
+        return this.#store.getRecentBefore(event.conversation.id, event.id, this.#historyLimit);
+    }
+    #recent(conversationId) {
+        if (conversationId.endsWith("@chatroom") && this.#sharedConversationState) {
+            return this.#sharedConversationState.recent(conversationId, this.#historyLimit, this.#bot);
+        }
+        return this.#store.getRecent(conversationId, this.#historyLimit);
+    }
+    #botFor(event) {
+        const resolved = this.#botIdentityResolver?.(event);
+        const base = resolved
+            ? {
+                ...this.#bot,
+                ...(resolved.displayName?.trim() ? { displayName: resolved.displayName.trim() } : {}),
+                ...(resolved.wakeWords ? { wakeWords: [...new Set(resolved.wakeWords.map((word) => word.trim()).filter(Boolean))] } : {}),
+            }
+            : this.#bot;
+        const aliases = this.#identityAliasesResolver?.(event) ?? [];
+        return aliases.length > 0 ? { ...base, aliasIds: aliases } : base;
+    }
+    close() {
+        if (this.#closed)
+            return;
+        this.#closed = true;
+        this.#store.close();
+    }
+    async #handle(event, context) {
+        const ingested = this.#store.ingest(event);
+        if (!ingested.inserted) {
+            const completed = this.#store.getOutcome(event.id, true);
+            if (completed) {
+                this.#trace({ type: "inbound.replayed", eventId: event.id, conversationId: event.conversation.id });
+                return completed;
+            }
+        }
+        else {
+            this.#trace({ type: "inbound.stored", eventId: event.id, conversationId: event.conversation.id });
+        }
+        this.#sharedConversationState?.prepareInbound(event);
+        this.#learnImplicitParticipationFeedback(event);
+        const triggerMessages = this.#recentBefore(event);
+        const activation = event.conversation.kind === "group"
+            ? (this.#store.getGroupActivation(event.conversation.id) ?? this.#defaultActivation)
+            : "always";
+        const quietHours = event.conversation.kind === "group" &&
+            this.#socialSchedule?.enabled === true &&
+            !isWithinActiveHours(event.timestamp ?? Date.now(), this.#socialSchedule.timezoneOffsetMinutes, this.#socialSchedule.activeStartMinute, this.#socialSchedule.activeEndMinute);
+        let baseDecision = await this.#triggerPolicy.decide({
+            event,
+            bot: this.#botFor(event),
+            activation,
+            recentMessages: triggerMessages,
+            continuationWindowMs: this.#continuationWindowMs,
+            ...(quietHours ? { quietHours: true } : {}),
+            ...(this.#socialSchedule?.enabled && !quietHours
+                ? {
+                    hotChat: {
+                        windowMs: this.#socialSchedule.hotChatWindowMs,
+                        minMessages: this.#socialSchedule.hotChatMinMessages,
+                        minParticipants: this.#socialSchedule.hotChatMinParticipants,
+                    },
+                }
+                : {}),
+        });
+        const autoParticipationAllowed = event.conversation.kind !== "group" || !this.#autoParticipationGate
+            ? true
+            : await this.#autoParticipationGate(event);
+        let participationModelUsed = false;
+        if (event.conversation.kind === "group" &&
+            (activation === "always" || activation === "mention") &&
+            !quietHours &&
+            !baseDecision.respond &&
+            (baseDecision.reason === "ambient-no-signal" || baseDecision.reason === "not-addressed") &&
+            autoParticipationAllowed &&
+            this.#judgeCooldownExpired(event) &&
+            recentConversationThread(triggerMessages, this.#bot.id, event.timestamp ?? Date.now(), this.#continuationWindowMs)) {
+            participationModelUsed = true;
+            const intensity = this.#participationIntensity(event);
+            baseDecision = await this.#judgeConversationContinuation(event, triggerMessages, intensity).catch((error) => {
+                this.#trace({ type: "agent.failed", eventId: event.id, error: `participation-judge: ${error instanceof Error ? error.message : String(error)}` });
+                return baseDecision;
+            });
+            this.#recordJudgeOutcome(event, baseDecision.respond, intensity);
+        }
+        let decision = this.#applyParticipationGuidance(event, activation, baseDecision);
+        if (decision.respond && isAutomaticParticipationReason(decision.reason) && !autoParticipationAllowed) {
+            decision = { respond: false, reason: "auto-participation-disabled" };
+        }
+        if (decision.respond &&
+            decision.reason === "ambient-hot-chat" &&
+            this.#proactiveGate &&
+            !(await this.#proactiveGate(event, "ambient-hot-chat"))) {
+            decision = { respond: false, reason: "ambient-rate-limited" };
+        }
+        this.#store.recordParticipationCase({
+            event,
+            context: triggerMessages,
+            activation,
+            decision,
+        });
+        if (participationModelUsed)
+            this.#store.markParticipationModelUsed(event.id);
+        this.#trace({ type: "trigger.decided", eventId: event.id, respond: decision.respond, reason: decision.reason });
+        if (!this.#store.claimProcessing(event.id, decision.reason)) {
+            const completed = this.#store.getOutcome(event.id, true);
+            if (completed)
+                return completed;
+            throw new Error(`Event ${event.id} is already being processed`);
+        }
+        if (!decision.respond) {
+            this.#store.completeParticipationCase(event.id, "ignored");
+            return this.#store.completeWithoutReply(event.id, decision.reason);
+        }
+        if (this.#responseGate && !(await this.#responseGate(event, decision.reason))) {
+            const reason = "shared-reply-arbitrated";
+            this.#store.completeParticipationCase(event.id, "ignored");
+            this.#trace({ type: "trigger.decided", eventId: event.id, respond: false, reason });
+            return this.#store.completeWithoutReply(event.id, reason);
+        }
+        return this.#runAgent(event, activation, triggerMessages, decision.reason, context);
+    }
+    #judgeCooldownExpired(event) {
+        const state = this.#judgeState.get(event.conversation.id);
+        return !state || (event.timestamp ?? Date.now()) >= state.until;
+    }
+    #participationIntensity(event) {
+        return this.#participationIntensityResolver?.(event) ?? "standard";
+    }
+    #recordJudgeOutcome(event, responded, intensity) {
+        const now = event.timestamp ?? Date.now();
+        if (responded) {
+            this.#judgeState.delete(event.conversation.id);
+            return;
+        }
+        const misses = (this.#judgeState.get(event.conversation.id)?.misses ?? 0) + 1;
+        const backoffMs = Math.min(PARTICIPATION_INTENSITY[intensity].initialBackoffMs * 2 ** (misses - 1), 5 * 60_000);
+        this.#judgeState.set(event.conversation.id, { until: now + backoffMs, misses });
+        if (this.#judgeState.size > 500) {
+            const oldest = this.#judgeState.keys().next().value;
+            if (oldest !== undefined)
+                this.#judgeState.delete(oldest);
+        }
+    }
+    async #judgeConversationContinuation(event, messages, intensity) {
+        const activeBot = this.#botFor(event);
+        const thread = recentConversationThread(messages, this.#bot.id, event.timestamp ?? Date.now(), this.#continuationWindowMs);
+        if (!thread)
+            return { respond: false, reason: "ambient-no-signal" };
+        const runner = this.#participationJudgeRunner ?? this.#runnerResolver?.(event) ?? this.#runner;
+        const transcript = [...thread.slice(-6), {
+                sequence: Number.MAX_SAFE_INTEGER,
+                id: event.id,
+                conversationId: event.conversation.id,
+                direction: "inbound",
+                senderId: event.sender.id,
+                senderName: event.sender.displayName,
+                text: event.text,
+                timestamp: event.timestamp ?? Date.now(),
+            }].map((message) => ({
+            speaker: message.direction === "outbound" ? activeBot.displayName : message.senderName,
+            role: message.direction === "outbound" ? "bot" : "human",
+            text: message.text.slice(0, 160),
+        }));
+        const result = await runner.run({
+            systemPrompt: participationJudgeSystemPrompt(intensity),
+            prompt: `${JSON.stringify({
+                recentConversation: transcript,
+                outputSchema: {
+                    decision: "speak | silent",
+                    reason: "followup | correction | new_info | ack_only | human_to_human | topic_shift | no_value | uncertain",
+                    confidence: "number between 0 and 1",
+                },
+                participationIntensity: intensity,
+                rules: [
+                    "speak 只能搭配 followup、correction 或 new_info",
+                    "silent 只能搭配 ack_only、human_to_human、topic_shift、no_value 或 uncertain",
+                    "不确定当前消息是不是在对机器人说时选择 silent/uncertain",
+                    "不要因为关键词相似就认定同一话题，要结合说话人和语义关系",
+                ],
+                examples: [
+                    {
+                        conversation: ["群友：球场从哪边走？", "机器人：从东门走最近。", "另一群友：东门出来就是那条小路吧？"],
+                        output: { decision: "speak", reason: "followup", confidence: 0.9 },
+                    },
+                    {
+                        conversation: ["机器人：活动九点开始。", "群友：通知刚改成十点了，你再确认下。"],
+                        output: { decision: "speak", reason: "correction", confidence: 0.94 },
+                    },
+                    {
+                        conversation: ["机器人：代理已经恢复。", "群友：那现在延迟大概多少？"],
+                        output: { decision: "speak", reason: "followup", confidence: 0.95 },
+                    },
+                    {
+                        conversation: ["机器人：文件已经发群里了。", "群友：好的，谢谢。"],
+                        output: { decision: "silent", reason: "ack_only", confidence: 0.97 },
+                    },
+                    {
+                        conversation: ["机器人：明天可能下雨。", "群友甲：老林，你明天有空吗？"],
+                        output: { decision: "silent", reason: "human_to_human", confidence: 0.96 },
+                    },
+                    {
+                        conversation: ["机器人：网络恢复了。", "群友：今晚吃什么？"],
+                        output: { decision: "silent", reason: "topic_shift", confidence: 0.98 },
+                    },
+                    {
+                        conversation: ["机器人：这个版本已经修好健康检查。", "群友：确实。"],
+                        output: { decision: "silent", reason: "no_value", confidence: 0.92 },
+                    },
+                    {
+                        conversation: ["机器人：可以从设置里打开。", "群友：那边呢？"],
+                        output: { decision: "silent", reason: "uncertain", confidence: 0.64 },
+                    },
+                ],
+            })}`,
+            sessionId: `participation-judge:${event.conversation.id}:${event.id}`,
+            tools: [],
+            budget: { maxLlmCalls: 1, maxToolCalls: 0, timeoutMs: 20_000 },
+        });
+        const decision = parseConversationJudge(result.text);
+        if (decision.decision === "speak" && decision.confidence >= PARTICIPATION_INTENSITY[intensity].threshold) {
+            return {
+                respond: true,
+                reason: `conversation-followup:${decision.reason}:${decision.confidence.toFixed(2)}`,
+            };
+        }
+        return {
+            respond: false,
+            reason: decision.decision === "speak"
+                ? `conversation-silent:low_confidence:${decision.confidence.toFixed(2)}`
+                : `conversation-silent:${decision.reason}:${decision.confidence.toFixed(2)}`,
+        };
+    }
+    async #handleDirect(event, text, reason, parts) {
+        const ingested = this.#store.ingest(event);
+        if (!ingested.inserted) {
+            const completed = this.#store.getOutcome(event.id, true);
+            if (completed) {
+                this.#trace({ type: "inbound.replayed", eventId: event.id, conversationId: event.conversation.id });
+                return completed;
+            }
+        }
+        else {
+            this.#trace({ type: "inbound.stored", eventId: event.id, conversationId: event.conversation.id });
+        }
+        this.#sharedConversationState?.prepareInbound(event);
+        const recent = this.#recentBefore(event);
+        const activation = event.conversation.kind === "group"
+            ? (this.#store.getGroupActivation(event.conversation.id) ?? this.#defaultActivation)
+            : "always";
+        this.#store.recordParticipationCase({
+            event,
+            context: recent,
+            activation,
+            decision: { respond: true, reason },
+        });
+        this.#trace({ type: "trigger.decided", eventId: event.id, respond: true, reason });
+        if (this.#responseGate && !(await this.#responseGate(event, reason))) {
+            const gateReason = "shared-reply-arbitrated";
+            this.#store.completeParticipationCase(event.id, "ignored");
+            this.#trace({ type: "trigger.decided", eventId: event.id, respond: false, reason: gateReason });
+            return this.#store.completeWithoutReply(event.id, gateReason);
+        }
+        if (!this.#store.claimProcessing(event.id, reason)) {
+            const completed = this.#store.getOutcome(event.id, true);
+            if (completed)
+                return completed;
+            throw new Error(`Event ${event.id} is already being processed`);
+        }
+        const replyText = text || renderMessageParts(parts, true).join("\n");
+        this.#store.completeParticipationCase(event.id, "replied", replyText);
+        return this.#completeWithReply(event, replyText, parts.length > 0 ? parts : [textPart(replyText)], reason);
+    }
+    async #handleWithPrompt(event, prompt, reason) {
+        const ingested = this.#store.ingest(event);
+        if (!ingested.inserted) {
+            const completed = this.#store.getOutcome(event.id, true);
+            if (completed) {
+                this.#trace({ type: "inbound.replayed", eventId: event.id, conversationId: event.conversation.id });
+                return completed;
+            }
+        }
+        else {
+            this.#trace({ type: "inbound.stored", eventId: event.id, conversationId: event.conversation.id });
+        }
+        this.#sharedConversationState?.prepareInbound(event);
+        const recent = this.#recentBefore(event);
+        const activation = event.conversation.kind === "group"
+            ? (this.#store.getGroupActivation(event.conversation.id) ?? this.#defaultActivation)
+            : "always";
+        this.#store.recordParticipationCase({
+            event,
+            context: recent,
+            activation,
+            decision: { respond: true, reason },
+        });
+        this.#trace({ type: "trigger.decided", eventId: event.id, respond: true, reason });
+        if (this.#responseGate && !(await this.#responseGate(event, reason))) {
+            const gateReason = "shared-reply-arbitrated";
+            this.#store.completeParticipationCase(event.id, "ignored");
+            this.#trace({ type: "trigger.decided", eventId: event.id, respond: false, reason: gateReason });
+            return this.#store.completeWithoutReply(event.id, gateReason);
+        }
+        if (!this.#store.claimProcessing(event.id, reason)) {
+            const completed = this.#store.getOutcome(event.id, true);
+            if (completed)
+                return completed;
+            throw new Error(`Event ${event.id} is already being processed`);
+        }
+        return this.#runAgent(event, activation, recent, reason, {}, prompt);
+    }
+    async #handleIgnored(event, reason) {
+        const ingested = this.#store.ingest(event);
+        if (!ingested.inserted) {
+            const completed = this.#store.getOutcome(event.id, true);
+            if (completed) {
+                this.#trace({ type: "inbound.replayed", eventId: event.id, conversationId: event.conversation.id });
+                return completed;
+            }
+        }
+        else {
+            this.#trace({ type: "inbound.stored", eventId: event.id, conversationId: event.conversation.id });
+        }
+        this.#sharedConversationState?.prepareInbound(event);
+        this.#trace({ type: "trigger.decided", eventId: event.id, respond: false, reason });
+        return this.#store.completeWithoutReply(event.id, reason);
+    }
+    async #handleProactive(request) {
+        const triggerMessages = this.#recent(request.conversationId);
+        const prepared = this.#store.beginProactiveEvent(request, this.#bot.id, triggerMessages);
+        if (!prepared.inserted) {
+            const completed = this.#store.getOutcome(request.id, true);
+            if (completed)
+                return completed;
+        }
+        const reason = `proactive-${request.kind}`;
+        if (!this.#store.claimProcessing(request.id, reason)) {
+            const completed = this.#store.getOutcome(request.id, true);
+            if (completed)
+                return completed;
+            throw new Error(`Proactive event ${request.id} is already being processed`);
+        }
+        return this.#runAgent(prepared.event, "always", triggerMessages, reason, {});
+    }
+    async #findRelevantMemories(event, store, conversationId, personId, query, limit) {
+        const lexicalLimit = Math.max(limit * 4, 48);
+        const lexical = store.findRelevantMemories(conversationId, personId, query, lexicalLimit);
+        if (limit === 0 || !this.#memoryEmbeddingProvider)
+            return lexical.slice(0, limit);
+        const candidates = store.listMemoriesForEmbedding(conversationId, personId, 500);
+        if (candidates.length === 0)
+            return lexical.slice(0, limit);
+        // With few enough memories every candidate ships anyway; semantic reranking
+        // would only reorder them at the cost of one embedding call per turn.
+        if (candidates.length <= limit) {
+            return [...candidates].sort((left, right) => right.importance - left.importance);
+        }
+        try {
+            const provider = this.#memoryEmbeddingProvider;
+            const queryVector = await this.#embedQuery(provider, query.slice(0, 8_000));
+            if (!queryVector || queryVector.length === 0)
+                throw new Error("embedding provider returned no query vector");
+            const missing = candidates.filter((memory) => !store.getMemoryEmbedding(memory.id, provider.model));
+            if (missing.length > 0) {
+                const vectors = await provider.embed(missing.map((memory) => memory.content.slice(0, 8_000)), "retrieval_document");
+                if (vectors.length !== missing.length)
+                    throw new Error("embedding provider returned an incomplete document batch");
+                for (let index = 0; index < missing.length; index += 1) {
+                    store.saveMemoryEmbedding(missing[index].id, provider.model, vectors[index]);
+                }
+            }
+            const lexicalRanks = new Map(lexical.map((memory, index) => [memory.id, index]));
+            return candidates
+                .map((memory) => {
+                const vector = store.getMemoryEmbedding(memory.id, provider.model);
+                const semantic = vector ? normalizedCosine(queryVector, vector) : 0;
+                const lexicalIndex = lexicalRanks.get(memory.id);
+                const lexicalScore = lexicalIndex === undefined ? 0 : 1 - lexicalIndex / Math.max(1, lexical.length);
+                return {
+                    memory,
+                    score: semantic * 0.65 + lexicalScore * 0.30 + memory.importance * 0.05,
+                };
+            })
+                .sort((left, right) => right.score - left.score)
+                .slice(0, limit)
+                .map((item) => item.memory);
+        }
+        catch (error) {
+            this.#trace({
+                type: "memory.embedding.failed",
+                eventId: event.id,
+                error: error instanceof Error ? error.message : String(error),
+            });
+            return lexical.slice(0, limit);
+        }
+    }
+    async #embedQuery(provider, query) {
+        const key = `${provider.model} ${query.normalize("NFKC").replace(/\s+/gu, " ").trim().toLocaleLowerCase()}`;
+        const cached = this.#queryEmbeddingCache.get(key);
+        if (cached) {
+            // Refresh LRU position.
+            this.#queryEmbeddingCache.delete(key);
+            this.#queryEmbeddingCache.set(key, cached);
+            return cached;
+        }
+        const [vector] = await provider.embed([query], "retrieval_query");
+        if (vector && vector.length > 0) {
+            this.#queryEmbeddingCache.set(key, vector);
+            if (this.#queryEmbeddingCache.size > 200) {
+                const oldest = this.#queryEmbeddingCache.keys().next().value;
+                if (oldest !== undefined)
+                    this.#queryEmbeddingCache.delete(oldest);
+            }
+        }
+        return vector;
+    }
+    async #runAgent(event, activation, triggerMessages, triggerReason, context, pluginInstruction) {
+        const activeBot = this.#botFor(event);
+        // Digest-style scheduled turns already carry their full source material in
+        // the event text; recent history and memory recall would only duplicate it.
+        const digestTurn = event.metadata?.proactiveKind === "morning-brief" ||
+            event.metadata?.proactiveKind === "group-summary";
+        const contextMessages = digestTurn
+            ? []
+            : event.conversation.kind === "group"
+                ? selectGroupTurnContext(triggerMessages, event, this.#continuationWindowMs)
+                : triggerMessages;
+        const recentMessages = fitRecentMessages(contextMessages, event.conversation.kind === "group" ? Math.min(this.#maxHistoryChars, 6_000) : this.#maxHistoryChars);
+        const startedAt = Date.now();
+        const contextReset = this.conversationContextReset(event.conversation.id);
+        const { sessionId, sessionScope, contextEpoch } = createChatSessionDescriptor({
+            conversationKind: event.conversation.kind,
+            conversationId: event.conversation.id,
+            sessionNamespace: this.#sessionNamespace,
+            sessionScope: this.#sessionKeyResolver?.(event) ?? "default",
+            ...(contextReset ? { contextReset } : {}),
+        });
+        this.#store.markParticipationModelUsed(event.id);
+        this.#trace({
+            type: "agent.started",
+            eventId: event.id,
+            conversationId: event.conversation.id,
+            sessionId,
+            sessionScope,
+            contextEpoch,
+        });
+        const stopPendingFeedback = this.#pendingFeedback?.({
+            event,
+            triggerReason,
+            recentMessages: triggerMessages,
+        });
+        try {
+            const stateEvent = event.conversation.kind === "group" && this.#sharedConversationState
+                ? this.#sharedConversationState.mapEvent(event)
+                : event;
+            const stateStore = event.conversation.kind === "group" && this.#sharedConversationState
+                ? this.#sharedConversationState.store
+                : this.#store;
+            const memories = digestTurn ? [] : await this.#findRelevantMemories(event, stateStore, stateEvent.conversation.id, stateEvent.sender.id, event.text, this.#memoryLimit);
+            const members = stateStore.listMembers(stateEvent.conversation.id).map((member) => ({
+                ...member,
+                displayName: safeGroupDisplayName(member.displayName, member.id, member.isBot ? "机器人" : "群友"),
+            }));
+            const behaviors = stateStore.getBehaviorRules(stateEvent.conversation.id, stateEvent.sender.id, this.#behaviorLimit);
+            const preverifiedKnowledge = await this.#autoLookupKnowledge(stateEvent, recentMessages, triggerReason);
+            const stagedParts = [];
+            let tools = createCoreTools({
+                store: stateStore,
+                event: stateEvent,
+                trace: (traceEvent) => this.#trace(traceEvent),
+                canManageConversationBehavior: this.#operatorIds.has(event.sender.id),
+                ...(this.#knowledgeRetriever ? { knowledgeRetriever: this.#knowledgeRetriever } : {}),
+                maxKnowledgeChars: this.#maxKnowledgeChars,
+            });
+            if (requiresExplicitGroupReply(event, triggerReason)) {
+                tools = tools.filter((tool) => tool.name !== "skip_reply");
+            }
+            const imageUnderstandingProvider = this.#imageUnderstandingProviderResolver?.(event) ?? this.#imageUnderstandingProvider;
+            if (imageUnderstandingProvider && context.mediaResolver) {
+                const availableImages = collectAvailableImages(this.#store, event, triggerMessages, this.#imageContextMessageLimit, this.#imageContextWindowMs, this.#maxAvailableImagesPerTurn);
+                const imageTool = createImageUnderstandingTool({
+                    event,
+                    images: availableImages,
+                    mediaResolver: context.mediaResolver,
+                    provider: imageUnderstandingProvider,
+                    trace: (traceEvent) => this.#trace(traceEvent),
+                    maxCalls: this.#maxImageUnderstandingCalls,
+                    maxImageBytes: this.#maxImageBytes,
+                    maxEvidenceChars: this.#maxImageEvidenceChars,
+                    timeoutMs: this.#imageUnderstandingTimeoutMs,
+                    cache: this.#store,
+                });
+                if (imageTool)
+                    tools.push(imageTool);
+            }
+            if (context.mediaResolver) {
+                const attachmentTool = createAttachmentInspectionTool({ event, mediaResolver: context.mediaResolver });
+                if (attachmentTool)
+                    tools.push(attachmentTool);
+            }
+            appendProvidedTools(tools, this.#toolProviders, event, (part) => {
+                if (stagedParts.length >= 20)
+                    throw new Error("A turn cannot stage more than 20 outbound message parts");
+                validateMessageParts([part]);
+                stagedParts.push(part);
+            });
+            if (event.metadata?.proactiveKind !== undefined) {
+                // Scheduled/plugin participation is text-only unless a future request
+                // type explicitly models an approved output modality. Tool prose is not
+                // a security boundary: remove TTS before the model can call it.
+                tools = tools.filter((tool) => tool.name !== "synthesize_speech");
+            }
+            if (digestTurn) {
+                // Digest output is plain text; the emoji catalog would only add prompt weight.
+                tools = tools.filter((tool) => tool.name !== "send_emoji" && tool.name !== "search_emojis");
+            }
+            const voiceReplyMode = preferredVoiceReplyMode(event, triggerReason, tools.some((tool) => tool.name === "synthesize_speech"), this.#voiceModeResolver?.(event) ?? "text");
+            const semanticEmojiBattle = triggerReason === "ambient-emoji-battle" &&
+                typeof event.metadata?.emojiBattleDescription === "string" &&
+                event.metadata.emojiBattleDescription.trim().length > 0;
+            if (triggerReason === "ambient-emoji-battle") {
+                tools = tools.filter((tool) => tool.name === "send_emoji" || tool.name === "search_emojis");
+            }
+            const runner = semanticEmojiBattle && this.#emojiBattleRunner
+                ? this.#emojiBattleRunner
+                : this.#runnerResolver?.(event) ?? this.#runner;
+            const turnPrompt = buildTurnPrompt({
+                event,
+                activation,
+                recentMessages,
+                memories,
+                behaviors,
+                members,
+                triggerReason,
+                knowledgeAvailable: this.#knowledgeRetriever !== undefined,
+                ...(preverifiedKnowledge ? { preverifiedKnowledge } : {}),
+                emojiAvailable: tools.some((tool) => tool.name === "send_emoji"),
+                recentReplyStyle: recentReplyStyleFingerprint(recentMessages),
+                ...(voiceReplyMode ? { voiceReplyMode } : {}),
+            });
+            const emojiTool = tools.find((tool) => tool.name === "send_emoji");
+            const emojiRecommendation = emojiTool ? emojiToolRecommendation(emojiTool) : undefined;
+            const result = triggerReason === "ambient-emoji-battle" && !semanticEmojiBattle
+                ? { text: "" }
+                : await runner.run({
+                    systemPrompt: buildSystemPrompt(activeBot, this.#soulResolver?.(event) ?? this.#baseSoul),
+                    prompt: pluginInstruction
+                        ? `${turnPrompt}\n\n<trusted_plugin_instruction>\n${pluginInstruction}\n</trusted_plugin_instruction>`
+                        : turnPrompt,
+                    sessionId,
+                    tools,
+                    budget: {
+                        maxLlmCalls: this.#maxAgentLlmCalls,
+                        maxToolCalls: this.#maxAgentToolCalls,
+                        timeoutMs: this.#agentTimeoutMs,
+                    },
+                });
+            let guarded = guardAgentText(result.text, event.text);
+            if (guarded.blocked) {
+                this.#trace({ type: "agent.output_blocked", eventId: event.id, reason: guarded.reason ?? "internal-deliberation" });
+            }
+            // An explicitly addressed turn must not go silent because the output
+            // guard tripped: retry once, text-only, with a corrective instruction.
+            if (guarded.blocked && guarded.reason !== "upstream-error" && requiresExplicitGroupReply(event, triggerReason)) {
+                const retried = await runner.run({
+                    systemPrompt: buildSystemPrompt(activeBot, this.#soulResolver?.(event) ?? this.#baseSoul),
+                    prompt: `${turnPrompt}\n\n<output_correction>你上一次的输出因为混入了内部分析、元话语或工具说明而被拦截，没有发出去。当前群友在等待回应。现在只输出要直接发到聊天里的最终自然回复（一两句即可），不要任何标题、前缀、分析过程或对规则的引用。</output_correction>`,
+                    sessionId,
+                    tools: [],
+                    budget: { maxLlmCalls: 1, maxToolCalls: 0, timeoutMs: Math.min(this.#agentTimeoutMs, 30_000) },
+                }).catch((error) => {
+                    this.#trace({
+                        type: "agent.failed",
+                        eventId: event.id,
+                        error: `guard-retry: ${error instanceof Error ? error.message : String(error)}`,
+                    });
+                    return undefined;
+                });
+                if (retried) {
+                    guarded = guardAgentText(retried.text, event.text);
+                    if (guarded.blocked) {
+                        this.#trace({ type: "agent.output_blocked", eventId: event.id, reason: guarded.reason ?? "internal-deliberation" });
+                    }
+                }
+            }
+            let replyText = triggerReason === "ambient-emoji-battle" ? null : guarded.text;
+            let suppliedParts = [...stagedParts, ...(result.parts ?? [])];
+            if (!guarded.blocked &&
+                !voiceReplyMode &&
+                replyText &&
+                suppliedParts.length === 0 &&
+                emojiTool &&
+                emojiRecommendation?.autoAllowed &&
+                shouldReplaceShortReactionWithEmoji(replyText)) {
+                await emojiTool.execute(`emoji-policy:${event.id}`, { emojiId: emojiRecommendation.emojiId });
+                suppliedParts = [...stagedParts, ...(result.parts ?? [])];
+                replyText = null;
+            }
+            if (!guarded.blocked && voiceReplyMode && replyText && !hasOutboundVoice(suppliedParts)) {
+                const speechText = cleanReply(replyText, Math.min(this.#maxReplyChars, 8_000));
+                const speechTool = tools.find((tool) => tool.name === "synthesize_speech");
+                if (speechText && speechTool) {
+                    await speechTool.execute(`voice-policy:${event.id}`, {
+                        text: speechText,
+                        ...(voiceReplyMode === "whisper" ? { style: WHISPER_TTS_STYLE } : {}),
+                    });
+                    suppliedParts = [...stagedParts, ...(result.parts ?? [])];
+                }
+            }
+            if (voiceReplyMode && hasOutboundVoice(suppliedParts))
+                replyText = null;
+            const reply = sanitizeReplyIdentities(cleanAgentReply(replyText, suppliedParts, this.#maxReplyChars), members);
+            this.#store.completeParticipationCase(event.id, guarded.blocked ? "blocked" : reply === null ? "silent" : "replied", reply?.text);
+            this.#trace({
+                type: "agent.finished",
+                eventId: event.id,
+                replied: reply !== null,
+                durationMs: Date.now() - startedAt,
+                ...(result.telemetry ? { telemetry: result.telemetry } : {}),
+            });
+            if (reply === null)
+                return this.#store.completeWithoutReply(event.id, "agent-silent");
+            const outboundParts = decorateReplyParts(event, [activeBot.id, ...(this.#identityAliasesResolver?.(event) ?? [])], triggerReason, reply.parts);
+            return this.#completeWithReply(event, reply.text, outboundParts, triggerReason, activeBot);
+        }
+        catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            this.#store.completeParticipationCase(event.id, "failed");
+            this.#store.markFailed(event.id, message);
+            this.#trace({ type: "agent.failed", eventId: event.id, error: message });
+            if (this.#responseGateRelease) {
+                try {
+                    await this.#responseGateRelease(event, triggerReason);
+                }
+                catch (releaseError) {
+                    this.#trace({
+                        type: "agent.failed",
+                        eventId: event.id,
+                        error: `response-gate-release: ${releaseError instanceof Error ? releaseError.message : String(releaseError)}`,
+                    });
+                }
+            }
+            throw error;
+        }
+        finally {
+            stopPendingFeedback?.();
+        }
+    }
+    #completeWithReply(event, text, parts, reason, activeBot = this.#botFor(event)) {
+        const result = this.#store.completeWithReply(event, activeBot.id, activeBot.displayName, text, parts, reason);
+        const action = result.actions[0];
+        if (action) {
+            this.#sharedConversationState?.appendOutbound(event, activeBot, action.id, text, action.createdAt);
+        }
+        return result;
+    }
+    #applyParticipationGuidance(event, activation, decision) {
+        if (event.conversation.kind !== "group" || activation !== "always")
+            return decision;
+        const guidance = this.#store.participationGuidance(event.conversation.id, event.text);
+        if (!guidance)
+            return decision;
+        const suffix = `${guidance.evidence}:${guidance.confidence.toFixed(2)}`;
+        if (guidance.label === "silent" && (decision.reason === "ambient-question" || decision.reason === "ambient-hot-chat")) {
+            return { respond: false, reason: `learned-silent:${suffix}` };
+        }
+        if (guidance.label === "speak" &&
+            decision.reason === "ambient-no-signal" &&
+            guidance.confidence >= PARTICIPATION_INTENSITY[this.#participationIntensity(event)].threshold) {
+            return { respond: true, reason: `learned-speak:${suffix}` };
+        }
+        return decision;
+    }
+    #learnImplicitParticipationFeedback(event) {
+        if (event.conversation.kind !== "group")
+            return;
+        const bot = this.#botFor(event);
+        const feedback = classifyParticipationFeedback(event, bot);
+        const quality = classifyReplyQualityFeedback(event, bot);
+        if (!feedback && !quality)
+            return;
+        const target = this.#store.participationFeedbackTarget(event.conversation.id, event.replyTo?.messageId, (event.timestamp ?? Date.now()) - 10 * 60_000);
+        if (!target)
+            return;
+        if (feedback) {
+            this.#store.recordParticipationFeedback({
+                eventId: target,
+                label: feedback.label,
+                reason: feedback.reason,
+                sourceEventId: event.id,
+            });
+        }
+        if (quality) {
+            this.#store.recordReplyQualityFeedback({
+                eventId: target,
+                label: quality.label,
+                reason: quality.reason,
+                sourceEventId: event.id,
+            });
+        }
+    }
+    async #autoLookupKnowledge(event, recentMessages, triggerReason) {
+        if (!this.#knowledgeRetriever || event.metadata?.proactiveKind)
+            return undefined;
+        const query = automaticKnowledgeQuery(event, recentMessages, triggerReason);
+        if (!query)
+            return undefined;
+        const startedAt = Date.now();
+        this.#trace({ type: "knowledge.lookup.started", eventId: event.id, query, automatic: true });
+        try {
+            const items = await this.#knowledgeRetriever.search({
+                query,
+                conversationId: event.conversation.id,
+                senderId: event.sender.id,
+                limit: 5,
+            });
+            this.#trace({
+                type: "knowledge.lookup.finished",
+                eventId: event.id,
+                count: items.length,
+                durationMs: Date.now() - startedAt,
+                automatic: true,
+            });
+            if (items.length === 0)
+                return "自动查证未找到结果；不要仅凭旧知识给出确定结论，可继续调用 lookup_knowledge 精确搜索。";
+            const text = items.slice(0, 5).map((item, index) => {
+                const source = item.source ? ` | 来源: ${item.source}` : "";
+                const updated = item.updatedAt ? ` | 时间: ${new Date(item.updatedAt).toISOString()}` : "";
+                return `[${index + 1}] ${item.title}${source}${updated}\n${item.content}`;
+            }).join("\n\n");
+            return text.length <= this.#maxKnowledgeChars ? text : `${text.slice(0, this.#maxKnowledgeChars)}\n[证据已截断]`;
+        }
+        catch (error) {
+            this.#trace({
+                type: "knowledge.lookup.failed",
+                eventId: event.id,
+                durationMs: Date.now() - startedAt,
+                error: error instanceof Error ? error.message : String(error),
+                automatic: true,
+            });
+            return "自动查证失败；不得假装已联网或凭旧知识给出确定结论，可尝试调用 lookup_knowledge，仍失败则说明不确定。";
+        }
+    }
+    #trace(event) {
+        try {
+            this.#onTrace?.(event);
+        }
+        catch {
+            // Observability must never break message handling.
+        }
+    }
+    #assertOpen() {
+        if (this.#closed)
+            throw new Error("GroupAgentCore is closed");
+    }
+}
+function collectAvailableImages(store, event, recentMessages, messageLimit, windowMs, maxImages) {
+    const current = (event.parts ?? [])
+        .filter((part) => part.type === "image")
+        .slice(0, maxImages)
+        .map((part, index) => ({
+        part,
+        messageId: event.id,
+        senderId: event.sender.id,
+        contextLabel: event.parts?.filter((candidate) => candidate.type === "image").length === 1
+            ? "current_message 的图片"
+            : `current_message 的第 ${index + 1} 张图片`,
+    }));
+    if (current.length >= maxImages)
+        return current;
+    const referenced = event.replyTo?.messageId
+        ? inboundImagesForMessage(store, event.replyTo.messageId, event.id).map((image) => ({
+            part: image.part,
+            messageId: image.messageId,
+            senderId: image.senderId,
+            contextLabel: "引用消息中的图片",
+        }))
+        : [];
+    if (current.length + referenced.length >= maxImages) {
+        return [...referenced.slice(-(maxImages - current.length)), ...current];
+    }
+    if (current.length === 0 && referenced.length === 0 && !referencesVisualContext(event.text))
+        return [];
+    if (messageLimit === 0 || windowMs === 0)
+        return [...referenced, ...current];
+    const recent = recentMessages.slice(-messageLimit);
+    const previous = [];
+    const currentTimestamp = event.timestamp ?? Date.now();
+    for (const [index, message] of recent.entries()) {
+        if (message.direction !== "inbound" || Math.abs(currentTimestamp - message.timestamp) > windowMs)
+            continue;
+        const messagesAgo = recent.length - index;
+        for (const image of inboundImagesForMessage(store, message.sourceEventId ?? message.id, event.id)) {
+            previous.push({
+                part: image.part,
+                messageId: image.messageId,
+                senderId: image.senderId,
+                contextLabel: `${messagesAgo} 条消息前的图片`,
+            });
+        }
+    }
+    const remaining = Math.min(1, maxImages - current.length - referenced.length);
+    const seen = new Set(referenced.map((image) => image.messageId));
+    const uniquePrevious = previous.filter((image) => !seen.has(image.messageId));
+    return [...uniquePrevious.slice(-remaining), ...referenced, ...current];
+}
+function inboundImagesForMessage(store, sourceEventId, currentEventId) {
+    for (const candidate of localSourceEventIds(sourceEventId, currentEventId)) {
+        const images = store.getInboundImages(candidate);
+        if (images.length > 0)
+            return images;
+    }
+    return [];
+}
+function localSourceEventIds(sourceEventId, currentEventId) {
+    const ids = new Set([sourceEventId]);
+    const source = /:(?:ipadmsg|wxmsg):(.+)$/u.exec(sourceEventId);
+    const current = /^(.*):(ipadmsg|wxmsg):.+$/u.exec(currentEventId);
+    if (source && current)
+        ids.add(`${current[1]}:${current[2]}:${source[1]}`);
+    return [...ids];
+}
+function classifyParticipationFeedback(event, bot) {
+    const text = event.text.normalize("NFKC").replace(/\s+/g, " ").trim();
+    if (!text)
+        return undefined;
+    const botIds = new Set([bot.id, ...(bot.aliasIds ?? [])].map(canonicalIdentityId));
+    const addressed = (event.replyTo?.senderId ? botIds.has(canonicalIdentityId(event.replyTo.senderId)) : false) ||
+        (event.mentions?.some((mention) => botIds.has(canonicalIdentityId(mention.id))) ?? false) ||
+        [bot.displayName, ...(bot.wakeWords ?? [])].some((word) => word.trim() && text.toLocaleLowerCase().includes(word.trim().toLocaleLowerCase()));
+    if (!addressed)
+        return undefined;
+    if (/(?:闭嘴|别(?:再|老是|总是)?(?:插话|接话|抢话|回复|回话|说话)|没(?:人|谁)?问你|谁问你(?:了)?|不需要你(?:回答|回复)?|少说(?:两句|话)?|不要每条都回|别刷屏)/u.test(text)) {
+        return { label: "silent", reason: "群友明确表示这次不应参与" };
+    }
+    if (/(?:说得对|正解|靠谱|有用|帮大忙|谢谢|多谢|好评|厉害|牛(?:逼|啊|哇)?|可以的|回答得好|就是这个)/u.test(text)) {
+        return { label: "speak", reason: "群友明确肯定这次参与" };
+    }
+    return undefined;
+}
+function classifyReplyQualityFeedback(event, bot) {
+    const text = event.text.normalize("NFKC").replace(/\s+/g, " ").trim();
+    if (!text || !isFeedbackAddressedToBot(event, bot, text))
+        return undefined;
+    if (/(?:答错|说错|不对|不是这个|胡说|瞎说|编的|没用|没帮助|没看懂|看不懂|太长|太啰嗦|又重复|重复了|文不对题|答非所问|过时了|链接错|数据错)/u.test(text)) {
+        return { label: "unhelpful", reason: "群友明确指出回复质量问题" };
+    }
+    if (/(?:说得对|正解|靠谱|有用|帮大忙|解决了|谢谢|多谢|好评|厉害|回答得好|讲清楚了|就是这个|找到了|学到了)/u.test(text)) {
+        return { label: "helpful", reason: "群友明确肯定回复有帮助" };
+    }
+    return undefined;
+}
+function isFeedbackAddressedToBot(event, bot, text) {
+    const botIds = new Set([bot.id, ...(bot.aliasIds ?? [])].map(canonicalIdentityId));
+    return ((event.replyTo?.senderId ? botIds.has(canonicalIdentityId(event.replyTo.senderId)) : false) ||
+        (event.mentions?.some((mention) => botIds.has(canonicalIdentityId(mention.id))) ?? false) ||
+        [bot.displayName, ...(bot.wakeWords ?? [])].some((word) => word.trim() && text.toLocaleLowerCase().includes(word.trim().toLocaleLowerCase())));
+}
+function canonicalIdentityId(value) {
+    const normalized = value.normalize("NFKC").trim().toLocaleLowerCase();
+    return normalized.split(":").at(-1) || normalized;
+}
+function cleanReply(value, maxChars) {
+    if (value === null)
+        return null;
+    const text = toWechatPlainText(value.replace(/^NO_REPLY$/i, ""));
+    if (!text)
+        return null;
+    const chars = [...text];
+    if (chars.length <= maxChars)
+        return text;
+    return `${chars.slice(0, Math.max(1, maxChars - 1)).join("")}…`;
+}
+export function shouldReplaceShortReactionWithEmoji(value) {
+    const normalized = toWechatPlainText(value).replace(/\s+/gu, " ").trim();
+    if (!normalized || [...normalized].length > 18)
+        return false;
+    if (/[?？:：]/u.test(normalized))
+        return false;
+    return /(?:哈哈|笑死|笑不活|绷不住|确实|没错|收到|好嘞|可以|无语|离谱|逆天|服了|牛(?:逼|啊|哇)?|厉害|绝了|太棒|恭喜|抱抱|晚安|早安|可爱|爱了|666)/iu.test(normalized);
+}
+function guardAgentText(value, sourceText) {
+    if (value === null)
+        return { text: null, blocked: false };
+    const withoutClosedReasoning = value
+        .replace(/<think\b[^>]*>[\s\S]*?<\/think>/giu, "")
+        .replace(/<analysis\b[^>]*>[\s\S]*?<\/analysis>/giu, "")
+        .trim();
+    if (!withoutClosedReasoning)
+        return { text: null, blocked: false };
+    let candidate = withoutClosedReasoning;
+    if (/^\s*\[(?:proxysystem|provider|upstream)\s+error\]/iu.test(candidate) ||
+        /request blocked due to safety settings|finish reason\s*:\s*(?:prohibited_content|safety|blocklist|recitation)/iu.test(candidate)) {
+        return { text: null, blocked: true, reason: "upstream-error" };
+    }
+    const explicitFinal = extractExplicitFinalSection(candidate);
+    if (explicitFinal !== undefined) {
+        if (!explicitFinal)
+            return { text: null, blocked: true };
+        candidate = explicitFinal;
+    }
+    const source = sourceText.trim();
+    if (source && normalizeEchoText(candidate) === normalizeEchoText(source)) {
+        return { text: null, blocked: true, reason: "source-echo" };
+    }
+    if (source && candidate.startsWith(source) && candidate.length > source.length) {
+        candidate = candidate.slice(source.length).replace(/^\s*(?:---+)?\s*/u, "").trim();
+    }
+    const markers = [
+        /<(?:think|analysis)\b|<\/(?:think|analysis)>/iu,
+        /<(?:tool_uses?|tool_calls?|function_calls?)\b|<\/(?:tool_uses?|tool_calls?|function_calls?)>/iu,
+        /<\/?trusted_plugin_instruction>/iu,
+        /<!--[\s\S]*?(?:分析|思考|工具|调用|回复)[\s\S]*?-->/iu,
+        /(?:调用|使用)\s*`?skip_reply|skip_reply\s*工具/iu,
+        /根据规则\s*[:：]\s*\n\s*\d+[.、]/u,
+        /(?:^|\n)\s*直接(?:自然)?回答\s*[:：]/u,
+        /根据(?:群聊|系统|上述).{0,24}(?:规则|指令)/u,
+        /(?:这条|当前)消息.{0,180}(?:没有明确|不需要我|是在|是对)/su,
+        /我作为(?:群成员|被吐槽对象)|我会用.{0,48}(?:回复|回应)/su,
+        /没有(?:明确的)?问题需要我回答/u,
+        /(?:^|\n)\s*回复\s*[:：]/u,
+        /<chat_context>|<current_message>|current_message/iu,
+        /(?:^|\n)\s*(?:analysis|reasoning)\s*[:：]/iu,
+        /(?:^|\n)\s*#{1,6}\s*(?:分析|思考(?:过程)?|场景判断|回复策略|最终回复|回复)\s*$/mu,
+        /(?:^|\n)\s*(?:场景判断|回复策略)\s*[:：]/mu,
+        /(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*{1,2})?(?:思考过程|场景判断|回复策略|最终回复)(?:\*{1,2})?\s*[:：]?\s*(?:\n|$)/mu,
+        /(?:记忆|行为|知识查询|图片理解)\s*工具/u,
+        /\b(?:recall_history|lookup_knowledge|understand_image|generate_image|synthesize_speech|skip_reply)\b/iu,
+        /(?:调用|使用)\s*`?\b(?:memory|behavior)\b|\b(?:memory|behavior)\b\s*(?:工具|\()/iu,
+        /(?:无需|不需要|不必|需要|准备|将要|我会).{0,24}(?:调用|使用).{0,16}(?:工具|函数)/su,
+        /系统(?:提示|指令|规则)|内部(?:分析|判断|规则)|输出策略/u,
+        /(?:这个|当前).{0,12}(?:@|点名|提问).{0,80}(?:直接|回复|回答|自我介绍)/su,
+        /(?:当前|相关)?记忆.{0,80}(?:无需|不需要|没有).{0,40}(?:修正|修改|保存|处理)/su,
+        /直接给(?:一个|出|他|她)?.{0,60}(?:回复|回答|自我介绍).{0,24}(?:就好|即可)/su,
+        /保持(?:群聊|私聊|聊天)(?:的)?(?:氛围|语气|风格)/u,
+        /\bI (?:should|will|need to) (?:respond|reply|call|stay silent)\b/iu,
+    ];
+    if (markers.some((pattern) => pattern.test(candidate))) {
+        return { text: null, blocked: true, reason: "internal-deliberation" };
+    }
+    return { text: candidate, blocked: false };
+}
+function normalizeEchoText(value) {
+    return value.normalize("NFKC").replace(/[\s\p{P}\p{S}]+/gu, "").toLocaleLowerCase();
+}
+function extractExplicitFinalSection(value) {
+    const lines = value.split(/\r?\n/u);
+    const marker = /^\s*(?:#{1,6}\s*)?(?:\*{1,2})?(?:最终回复|回复|直接(?:自然)?回答)\s*[:：]?(?:\*{1,2})?\s*$/u;
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+        if (!marker.test(lines[index] ?? ""))
+            continue;
+        const finalText = lines
+            .slice(index + 1)
+            .join("\n")
+            .replace(/^\s*(?:(?:-{3,}|_{3,}|\*{3,})\s*)+/u, "")
+            .trim();
+        return finalText || null;
+    }
+    return undefined;
+}
+function cleanAgentReply(value, suppliedParts, maxChars) {
+    const text = cleanReply(value, maxChars);
+    const parts = (suppliedParts ?? []).map((part) => part.type === "text" ? { ...part, text: cleanReply(part.text, maxChars) ?? "" } : part);
+    const nonEmptyParts = parts.filter((part) => part.type !== "text" || part.text.length > 0);
+    validateMessageParts(nonEmptyParts);
+    if (text && !nonEmptyParts.some((part) => part.type === "text"))
+        nonEmptyParts.unshift(textPart(text));
+    if (nonEmptyParts.length === 0)
+        return null;
+    return { text: text ?? renderMessageParts(nonEmptyParts, true).join("\n"), parts: nonEmptyParts };
+}
+function requiresExplicitGroupReply(event, triggerReason) {
+    return event.conversation.kind === "group" &&
+        (triggerReason === "mention" || triggerReason === "wake-word" || triggerReason === "reply-to-bot");
+}
+function sanitizeReplyIdentities(reply, members) {
+    if (!reply)
+        return null;
+    return {
+        text: replaceWechatIds(reply.text, members),
+        parts: reply.parts.map((part) => part.type === "text"
+            ? { ...part, text: replaceWechatIds(part.text, members) }
+            : part),
+    };
+}
+function decorateReplyParts(event, botIds, triggerReason, parts) {
+    if (event.conversation.kind !== "group")
+        return parts;
+    const decorated = [...parts];
+    const identities = new Set(botIds.map(canonicalIdentityId));
+    const explicitlyMentioned = (event.mentions ?? []).some((mention) => identities.has(canonicalIdentityId(mention.id)));
+    if (shouldQuoteInbound(triggerReason)) {
+        decorated.unshift({
+            type: "quote",
+            messageId: event.id,
+            senderId: event.sender.id,
+            senderName: event.sender.displayName,
+            excerpt: [...event.text.normalize("NFKC").replace(/\s+/gu, " ").trim()].slice(0, 60).join(""),
+        });
+    }
+    if (explicitlyMentioned) {
+        decorated.unshift({ type: "mention", memberId: event.sender.id, displayName: event.sender.displayName });
+    }
+    validateMessageParts(decorated);
+    return decorated;
+}
+function shouldQuoteInbound(triggerReason) {
+    if (triggerReason.startsWith("proactive-"))
+        return false;
+    if (triggerReason === "ambient-hot-chat" || triggerReason === "ambient-voice" || triggerReason.startsWith("learned-speak:"))
+        return false;
+    return true;
+}
+function isAutomaticParticipationReason(triggerReason) {
+    return triggerReason === "ambient-question" ||
+        triggerReason === "ambient-hot-chat" ||
+        triggerReason === "ambient-voice" ||
+        triggerReason === "ambient-voice-request" ||
+        triggerReason === "ambient-name-mention" ||
+        triggerReason === "continuation" ||
+        triggerReason.startsWith("conversation-followup:") ||
+        triggerReason.startsWith("learned-speak:");
+}
+function hasOutboundVoice(parts) {
+    return parts.some((part) => part.type === "voice" || part.type === "audio");
+}
+function automaticKnowledgeQuery(event, recentMessages, triggerReason) {
+    const current = event.text.normalize("NFKC").replace(/\s+/gu, " ").trim();
+    if (current && shouldAutoLookupKnowledge(current))
+        return [...current].slice(0, 500).join("");
+    if (!isAutomaticParticipationReason(triggerReason) || triggerReason === "ambient-voice")
+        return undefined;
+    const context = [...recentMessages.slice(-5).map((message) => message.text), current]
+        .map((text) => text.normalize("NFKC").replace(/\s+/gu, " ").trim())
+        .filter(Boolean)
+        .join("；");
+    if (!context)
+        return undefined;
+    const boundedContext = [...context].slice(-1_800).join("");
+    if (!shouldAutoLookupKnowledge(boundedContext))
+        return undefined;
+    return [...boundedContext].slice(-500).join("");
+}
+function fitRecentMessages(messages, maxChars) {
+    const selected = [];
+    let remaining = maxChars;
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        const metadataAllowance = 120;
+        if (remaining <= metadataAllowance)
+            break;
+        const text = clipText(message.text, remaining - metadataAllowance);
+        selected.push(text === message.text ? message : { ...message, text });
+        remaining -= [...text].length + metadataAllowance;
+    }
+    return selected.reverse();
+}
+function recentReplyStyleFingerprint(messages) {
+    const replies = messages.filter((message) => message.direction === "outbound").slice(-5);
+    if (replies.length === 0)
+        return "近期没有机器人回复样本。";
+    const openers = replies.map((message) => message.text.normalize("NFKC").trim().slice(0, 12)).filter(Boolean);
+    const averageLength = Math.round(replies.reduce((sum, message) => sum + [...message.text].length, 0) / replies.length);
+    const questions = replies.filter((message) => /[？?]\s*$/u.test(message.text)).length;
+    return [
+        `最近 ${replies.length} 条回复的平均长度约 ${averageLength} 字，${questions} 条以问句收尾。`,
+        `近期起句：${openers.map((value) => `“${value}”`).join("、")}。`,
+        "本轮不要逐字重复近期回复，也不要机械复用相同起句、结尾反问或固定段落结构；内容确实相同也要针对当前消息直接表达。",
+    ].join(" ");
+}
+/** Selects the likely local sub-thread while retaining a small amount of ambient context. */
+function selectGroupTurnContext(messages, event, continuationWindowMs) {
+    const now = event.timestamp ?? Date.now();
+    // Adapt the context window to the room's pace: in a slow room the span of
+    // the last 15 messages keeps older-but-live topics visible, while a busy
+    // room naturally tightens back towards the 3-minute floor.
+    const paceSample = messages.slice(-15);
+    const paceSpanMs = paceSample.length >= 2 ? now - paceSample[0].timestamp : 0;
+    const windowMs = Math.min(Math.max(Math.min(continuationWindowMs, 3 * 60_000), paceSpanMs), 30 * 60_000);
+    const cutoff = now - windowMs;
+    const recent = messages
+        .filter((message) => message.timestamp >= cutoff && message.timestamp <= now)
+        .slice(-20);
+    const referenced = event.replyTo?.messageId
+        ? messages.find((message) => message.id === event.replyTo?.messageId || message.sourceEventId === event.replyTo?.messageId)
+        : undefined;
+    const followup = event.replyTo !== undefined || /(?:刚才|继续|接着|重新|再说|上面|前面|那个|这个|这张|图片|图里|下图|好好说|详细分析)/u.test(event.text);
+    const selected = new Map();
+    const add = (message) => {
+        if (message)
+            selected.set(message.sequence, message);
+    };
+    // Always preserve the immediate room atmosphere; when the adaptive window is
+    // sparse, fall back to the latest messages but never resurface anything
+    // older than the 30-minute ceiling.
+    const baseline = recent.length >= 5
+        ? recent.slice(-5)
+        : messages.filter((message) => message.timestamp >= now - 30 * 60_000 && message.timestamp <= now).slice(-5);
+    baseline.forEach(add);
+    let chain = referenced;
+    for (let depth = 0; chain && depth < 4; depth += 1) {
+        add(chain);
+        const parentId = chain.replyToMessageId;
+        chain = parentId
+            ? messages.find((message) => message.id === parentId || message.sourceEventId === parentId)
+            : undefined;
+    }
+    const currentTerms = new Set(extractSearchTerms(event.text).slice(0, 24));
+    const ranked = recent
+        .filter((message) => !selected.has(message.sequence))
+        .map((message, index) => {
+        const overlap = extractSearchTerms(message.text).reduce((count, term) => count + (currentTerms.has(term) ? 1 : 0), 0);
+        const sameSender = message.senderId === event.sender.id ? 2.5 : 0;
+        const botTurn = message.direction === "outbound" ? 1 : 0;
+        const recency = (index + 1) / Math.max(1, recent.length);
+        return { message, score: overlap * 2.5 + sameSender + botTurn + recency + (followup ? 0.5 : 0) };
+    })
+        .sort((left, right) => right.score - left.score || right.message.sequence - left.message.sequence);
+    for (const candidate of ranked) {
+        if (selected.size >= (followup ? 10 : 8))
+            break;
+        if (candidate.score < 1.25 && selected.size >= 6)
+            break;
+        add(candidate.message);
+    }
+    return [...selected.values()].sort((left, right) => left.sequence - right.sequence);
+}
+function referencesVisualContext(value) {
+    return /(?:图片|图里|图中|这图|那图|这张|截图|照片|画面|看图|下图|上图|配图|表情包|视觉|识图)/u.test(value.normalize("NFKC"));
+}
+function recentConversationThread(messages, botId, now, windowMs) {
+    if (windowMs <= 0)
+        return undefined;
+    let botIndex = -1;
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (message.direction === "outbound" && message.senderId === botId) {
+            botIndex = index;
+            break;
+        }
+    }
+    if (botIndex < 0)
+        return undefined;
+    const botMessage = messages[botIndex];
+    if (now < botMessage.timestamp || now - botMessage.timestamp > windowMs)
+        return undefined;
+    const messagesAfterBot = messages.length - botIndex - 1;
+    if (messagesAfterBot > 12)
+        return undefined;
+    return messages.slice(Math.max(0, botIndex - 6));
+}
+function participationJudgeSystemPrompt(intensity) {
+    const policy = intensity === "conservative"
+        ? "当前为保守档：仅在明确追问、纠正机器人，或机器人有明显关键新信息时 speak；有一点不确定就 silent。"
+        : intensity === "active"
+            ? "当前为积极档：除了明确追问和纠正，自然延续机器人刚参与的话题、合适的轻松接梗、或能提供实际帮助时也可 speak；但不要打断群友之间的私聊，不要只做无信息量附和。"
+            : "当前为标准档：追问、纠正机器人或机器人确实能补充有用新信息时 speak；不确定时 silent。";
+    return `你是微信群聊接话门控分类器，不负责回答问题。${policy} 只有笑声、感谢、收到、纯附和，群友之间互相对话，明显话题转移，以及机器人只能重复或礼貌应和时选择 silent。confidence 表示分类正确性的把握，不表示接话意愿。只输出一行 JSON，不输出解释、Markdown、代码围栏或工具调用。`;
+}
+function parseConversationJudge(value) {
+    if (!value)
+        throw new Error("Participation judge returned no JSON");
+    const candidate = /\{[\s\S]*\}/u.exec(value)?.[0];
+    if (!candidate || candidate.length > 2000)
+        throw new Error("Participation judge returned invalid JSON");
+    let parsed;
+    try {
+        parsed = JSON.parse(candidate);
+    }
+    catch {
+        throw new Error("Participation judge returned malformed JSON");
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        throw new Error("Participation judge returned a non-object");
+    }
+    const record = parsed;
+    const speakReasons = new Set(["followup", "correction", "new_info"]);
+    const silentReasons = new Set(["ack_only", "human_to_human", "topic_shift", "no_value", "uncertain"]);
+    if ((record.decision !== "speak" && record.decision !== "silent") ||
+        typeof record.reason !== "string" ||
+        !(record.decision === "speak" ? speakReasons : silentReasons).has(record.reason) ||
+        typeof record.confidence !== "number" ||
+        !Number.isFinite(record.confidence) ||
+        record.confidence < 0 ||
+        record.confidence > 1) {
+        throw new Error("Participation judge JSON does not match the schema");
+    }
+    return {
+        decision: record.decision,
+        reason: record.reason,
+        confidence: record.confidence,
+    };
+}
+function clipText(text, maxChars) {
+    const chars = [...text];
+    if (chars.length <= maxChars)
+        return text;
+    if (maxChars <= 1)
+        return "…";
+    const available = maxChars - 1;
+    const headLength = Math.ceil(available * 0.7);
+    const tailLength = available - headLength;
+    return `${chars.slice(0, headLength).join("")}…${chars.slice(chars.length - tailLength).join("")}`;
+}
+function validateEvent(event) {
+    if (event.type !== "message")
+        throw new Error("Unsupported event type");
+    if (!event.id.trim())
+        throw new Error("event.id cannot be empty");
+    if (!event.conversation.id.trim())
+        throw new Error("event.conversation.id cannot be empty");
+    if (!event.sender.id.trim())
+        throw new Error("event.sender.id cannot be empty");
+    if (!event.sender.displayName.trim())
+        throw new Error("event.sender.displayName cannot be empty");
+    validateMessageParts(event.parts);
+    if (!event.text.trim() && (event.attachments?.length ?? 0) === 0 && (event.parts?.length ?? 0) === 0) {
+        throw new Error("Message must have text, parts, or attachments");
+    }
+    if (event.timestamp !== undefined && (!Number.isSafeInteger(event.timestamp) || event.timestamp < 0)) {
+        throw new Error("event.timestamp must be a non-negative Unix timestamp in milliseconds");
+    }
+}
+export function createChatSessionDescriptor(input) {
+    const sessionScope = sessionKeySegment(input.sessionScope);
+    const sessionNamespace = sessionKeySegment(input.sessionNamespace);
+    const contextEpoch = input.contextReset?.resetAt ?? 0;
+    return {
+        sessionId: `chat:${input.conversationKind}:${sessionNamespace}:${input.conversationId}:scope:${sessionScope}:epoch:${contextEpoch}`,
+        sessionScope,
+        contextEpoch,
+    };
+}
+function sessionKeySegment(value) {
+    const normalized = value.normalize("NFKC").trim().toLocaleLowerCase();
+    if (!normalized)
+        return "default";
+    const safe = normalized.replace(/[^a-z\d._-]+/gu, "-").replace(/^-+|-+$/gu, "").slice(0, 120);
+    return safe || "default";
+}
+function isWechatGroupConversationId(value) {
+    return (value.normalize("NFKC").trim().split(":").at(-1) ?? "").endsWith("@chatroom");
+}
+function assertIdentity(bot) {
+    if (!bot.id.trim())
+        throw new Error("bot.id cannot be empty");
+    if (!bot.displayName.trim())
+        throw new Error("bot.displayName cannot be empty");
+}
+function boundedInteger(value, min, max, name) {
+    if (!Number.isSafeInteger(value) || value < min || value > max) {
+        throw new Error(`${name} must be an integer between ${min} and ${max}`);
+    }
+    return value;
+}
+function normalizedCosine(left, right) {
+    const dimensions = Math.min(left.length, right.length);
+    if (dimensions === 0 || left.length !== right.length)
+        return 0;
+    let dot = 0;
+    let leftMagnitude = 0;
+    let rightMagnitude = 0;
+    for (let index = 0; index < dimensions; index += 1) {
+        const leftValue = left[index];
+        const rightValue = right[index];
+        dot += leftValue * rightValue;
+        leftMagnitude += leftValue * leftValue;
+        rightMagnitude += rightValue * rightValue;
+    }
+    if (leftMagnitude <= 0 || rightMagnitude <= 0)
+        return 0;
+    return Math.max(0, Math.min(1, dot / Math.sqrt(leftMagnitude * rightMagnitude)));
+}
+export function isWithinActiveHours(timestamp, timezoneOffsetMinutes, startMinute, endMinute) {
+    const dayMinutes = 24 * 60;
+    const localMinute = Math.floor((timestamp + timezoneOffsetMinutes * 60_000) / 60_000) % dayMinutes;
+    const normalizedMinute = localMinute < 0 ? localMinute + dayMinutes : localMinute;
+    if (startMinute === endMinute)
+        return true;
+    if (startMinute < endMinute)
+        return normalizedMinute >= startMinute && normalizedMinute < endMinute;
+    return normalizedMinute >= startMinute || normalizedMinute < endMinute;
+}
+function appendProvidedTools(tools, providers, event, stagePart) {
+    const names = new Set(tools.map((tool) => tool.name));
+    for (const provider of providers) {
+        const provided = provider({ event, stagePart });
+        if (tools.length + provided.length > 64)
+            throw new Error("A turn cannot expose more than 64 tools");
+        for (const tool of provided) {
+            if (!tool.name.trim())
+                throw new Error("Provided Agent tool name cannot be empty");
+            if (names.has(tool.name))
+                throw new Error(`Duplicate Agent tool name: ${tool.name}`);
+            names.add(tool.name);
+            tools.push(tool);
+        }
+    }
+}
+//# sourceMappingURL=core.js.map

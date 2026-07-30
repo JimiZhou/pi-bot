@@ -1,7 +1,7 @@
 import { useState } from "react"
 import {
-  Archive,
   Clock3,
+  ExternalLink,
   ListFilter,
   MessageSquareText,
   MoreHorizontal,
@@ -24,7 +24,6 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { Input } from "@/components/ui/input"
@@ -198,11 +197,10 @@ export function SessionsPanel({ sessions }: { sessions: SessionRecord[] }) {
                           </Button>
                         </DropdownMenuTrigger>
                         <DropdownMenuContent align="end">
-                          <DropdownMenuItem>查看消息记录</DropdownMenuItem>
-                          <DropdownMenuItem>重置上下文</DropdownMenuItem>
-                          <DropdownMenuSeparator />
-                          <DropdownMenuItem>
-                            <Archive /> 归档会话
+                          <DropdownMenuItem asChild>
+                            <a href="#chatrooms">
+                              <ExternalLink /> 在群聊模块管理
+                            </a>
                           </DropdownMenuItem>
                         </DropdownMenuContent>
                       </DropdownMenu>

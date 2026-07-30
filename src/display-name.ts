@@ -32,6 +32,12 @@ export function replaceTransportIds(
   return result;
 }
 
+/**
+ * Backward-compatible name used by the private WeChat administration layer.
+ * The transport-independent implementation also handles wxid_/gh_ identities.
+ */
+export const replaceWechatIds = replaceTransportIds;
+
 export function canonicalIdentity(value: string): string {
   return value.normalize("NFKC").trim().toLocaleLowerCase();
 }

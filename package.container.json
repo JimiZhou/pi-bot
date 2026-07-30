@@ -1,0 +1,62 @@
+{
+  "name": "pi-wechat-agent",
+  "version": "0.1.0",
+  "description": "A lightweight, persistent, multimodal Pi-powered agent core for social group chats",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./channel": {
+      "types": "./dist/channel.d.ts",
+      "import": "./dist/channel.js"
+    },
+    "./media": {
+      "types": "./dist/media.d.ts",
+      "import": "./dist/media.js"
+    },
+    "./adapters/wx-hook-http": {
+      "types": "./dist/adapters/wx-hook-http.d.ts",
+      "import": "./dist/adapters/wx-hook-http.js"
+    },
+    "./adapters/wechat-ipad": {
+      "types": "./dist/adapters/wechat-ipad.d.ts",
+      "import": "./dist/adapters/wechat-ipad.js"
+    },
+    "./admin": {
+      "types": "./dist/admin/index.d.ts",
+      "import": "./dist/admin/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "webui",
+    "README.md",
+    "docs"
+  ],
+  "scripts": {
+    "start": "node dist/admin/main.js",
+    "start:webui": "node dist/admin/main.js",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "TSX_DISABLE_CACHE=1 node --import tsx --test test/*.test.ts",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.74.2",
+    "@earendil-works/pi-ai": "0.74.2",
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.3.0",
+    "tsx": "4.20.5",
+    "typescript": "5.9.2"
+  },
+  "license": "MIT"
+}

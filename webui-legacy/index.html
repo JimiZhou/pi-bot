@@ -1,0 +1,571 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>Pi WeChat Agent</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20x='2'%20y='2'%20width='28'%20height='28'%20rx='8'%20fill='%232563eb'/%3E%3Ccircle%20cx='11.5'%20cy='14'%20r='2.6'%20fill='%23fff'/%3E%3Ccircle%20cx='20.5'%20cy='14'%20r='2.6'%20fill='%23fff'/%3E%3Cpath%20d='M10%2021.5q6%203.4%2012%200'%20stroke='%23fff'%20stroke-width='2.4'%20stroke-linecap='round'%20fill='none'/%3E%3C/svg%3E">
+    <script>
+      (() => {
+        try {
+          const setting = localStorage.getItem("pi-theme") || "auto";
+          const dark = setting === "dark" || (setting !== "light" && matchMedia("(prefers-color-scheme: dark)").matches);
+          document.documentElement.dataset.theme = dark ? "dark" : "light";
+        } catch { document.documentElement.dataset.theme = "light"; }
+      })();
+    </script>
+    <link rel="stylesheet" href="/styles.css?v=17">
+    <script src="/app.js?v=17" defer></script>
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div class="brand"><span class="brand-dot"></span><span>Pi WeChat Agent</span></div>
+        <div class="top-actions">
+          <span id="connection" class="pill muted">未连接</span>
+          <button id="logout" class="ghost small" type="button">锁定</button>
+        </div>
+      </header>
+
+      <aside class="sidebar" aria-label="管理导航">
+        <div class="nav-group">
+          <div class="nav-group-title">运行</div>
+          <button class="nav active" data-view="overview" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg><span>概览</span></button>
+          <button class="nav" data-view="bots" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3"/></svg><span>机器人</span></button>
+          <button class="nav" data-view="logs" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M16 13H8M16 17H8M10 9H8"/></svg><span>日志</span></button>
+        </div>
+        <div class="nav-group">
+          <div class="nav-group-title">微信</div>
+          <button class="nav" data-view="chatrooms" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span>群聊管理</span></button>
+          <button class="nav" data-view="emojis" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg><span>表情包管理</span></button>
+          <button class="nav" data-view="wechat-identity" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-3.92 7.94"/></svg><span>微信身份</span></button>
+          <button class="nav" data-view="contacts" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg><span>联系人</span></button>
+          <button class="nav" data-view="moments" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg><span>朋友圈</span></button>
+        </div>
+        <div class="nav-group">
+          <div class="nav-group-title">AI 配置</div>
+          <button class="nav" data-view="providers" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg><span>Provider</span></button>
+          <button class="nav" data-view="models" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg><span>模型</span></button>
+          <button class="nav" data-view="knowledge" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg><span>联网检索</span></button>
+          <button class="nav" data-view="mcp" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg><span>MCP</span></button>
+          <button class="nav" data-view="personas" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg><span>人设</span></button>
+          <button class="nav" data-view="plugins" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg><span>插件</span></button>
+        </div>
+        <div class="nav-group">
+          <div class="nav-group-title">数据</div>
+          <button class="nav" data-view="participation" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg><span>参与学习</span></button>
+          <button class="nav" data-view="settings" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg><span>全局设置</span></button>
+        </div>
+        <div class="sidebar-foot">
+          <button id="theme-toggle" class="nav theme-toggle" type="button" title="切换配色主题"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg><span id="theme-toggle-label">主题：跟随系统</span></button>
+        </div>
+      </aside>
+
+      <main class="content">
+        <section id="view-overview" class="view active">
+          <div class="section-head"><div><h1>运行概览</h1><p>轻量控制面，不进入聊天热路径。</p></div><button id="refresh-all" class="ghost" type="button">刷新</button></div>
+          <div id="overview-stats" class="stats"></div>
+          <div class="overview-grid">
+            <div class="panel"><div class="panel-head"><div><h2>模型路由</h2><p>配置顺序与最近一次实际调用路径。</p></div></div><div id="overview-model-chains" class="model-chain-list"></div></div>
+            <div class="panel"><div class="panel-head"><div><h2>对话质量</h2><p>参与时机与回复有用性分开统计。</p></div></div><div id="overview-quality" class="quality-overview"></div></div>
+          </div>
+          <div class="panel"><div class="panel-head"><h2>机器人状态</h2></div><div id="overview-bots" class="bot-grid"></div></div>
+        </section>
+
+        <section id="view-bots" class="view">
+          <div class="section-head"><div><h1>机器人</h1><p>一个配置对应独立 Core、数据库和 Channel。</p></div><button id="add-bot" class="primary" type="button">新增机器人</button></div>
+          <div id="bots-list" class="stack"></div>
+        </section>
+
+        <section id="view-models" class="view">
+          <div class="section-head"><div><h1>模型</h1><p>一个 Provider 可以创建多个模型配置，再分配给全局、Bot 或群聊。</p></div><button id="add-model" class="primary" type="button">新增模型</button></div>
+          <div id="models-list" class="stack"></div>
+        </section>
+
+        <section id="view-plugins" class="view">
+          <div class="section-head"><div><h1>插件管理</h1><p>功能按机器人独立启用；保存后只重载对应 Bot，不改动 Channel 登录态。</p></div></div>
+          <div id="plugins-list" class="stack"></div>
+        </section>
+
+        <section id="view-chatrooms" class="view">
+          <div class="section-head"><div><h1>群聊管理</h1><p>集中管理每个群的模型、插件、定时任务、持久记忆、历史消息与主动发送。</p></div><button id="refresh-chatrooms" class="ghost" type="button">刷新</button></div>
+          <div class="chatroom-toolbar panel compact-panel">
+            <label>机器人<select id="chatroom-bot-filter"><option value="">全部机器人</option></select></label>
+            <label>搜索群聊<input id="chatroom-search" type="search" placeholder="群名称、备注或 ID"></label>
+            <div id="chatroom-count" class="meta"></div>
+          </div>
+          <form id="chatroom-bulk-form" class="chatroom-bulk-bar panel compact-panel">
+            <span id="chatroom-selected-count" class="pill muted">已选 0 个</span>
+            <label>批量人设<select name="personaProfileId"><option value="__unchanged__">人设不变</option><option value="">恢复继承</option></select></label>
+            <label>接话意愿<select name="participationIntensity"><option value="__unchanged__">强度不变</option><option value="conservative">保守</option><option value="standard">标准</option><option value="active">积极</option></select></label>
+            <label>批量插件<select name="pluginType"><option value="">插件不变</option></select></label>
+            <label>插件状态<select name="pluginEnabled"><option value="true">开启</option><option value="false">关闭</option></select></label>
+            <button class="primary" type="submit">应用到所选群</button>
+            <button id="chatroom-bulk-reset-context" class="ghost" type="button">重置所选群上下文</button>
+            <button id="chatroom-clear-selection" class="ghost" type="button">清空选择</button>
+          </form>
+          <div id="chatrooms-list" class="chatroom-dense-list"></div>
+        </section>
+
+        <section id="view-personas" class="view">
+          <div class="section-head"><div><h1>全局人设</h1><p>维护可复用人设库，按机器人和群聊选择；切换后立即生效并自动重置该群短期上下文。</p></div><button id="add-persona" class="primary" type="button">新增人设</button></div>
+          <div id="personas-list" class="persona-grid"></div>
+        </section>
+
+        <section id="view-emojis" class="view">
+          <div class="section-head"><div><h1>表情包管理</h1><p>机器人自动收集群聊和私聊里的微信动态表情，由视觉模型生成调用描述。</p></div><button id="refresh-emojis" class="ghost" type="button">刷新</button></div>
+          <div class="emoji-toolbar panel compact-panel">
+            <label>机器人<select id="emoji-bot-filter"><option value="">全部机器人</option></select></label>
+            <label>搜索描述<input id="emoji-search" type="search" placeholder="情绪、动作或使用场景"></label>
+            <div id="emoji-count" class="meta"></div>
+          </div>
+          <div id="emojis-list" class="emoji-grid"></div>
+        </section>
+
+        <section id="view-wechat-identity" class="view">
+          <div class="section-head"><div><h1>微信身份</h1><p>管理全局微信昵称、签名、头像和二维码。账号资料会影响该微信账号所在的全部群聊。</p></div><button id="refresh-wechat-identity" class="ghost" type="button">刷新</button></div>
+          <div class="panel wechat-toolbar"><label>iPad 机器人<select id="wechat-identity-bot"></select></label><span id="wechat-identity-capability" class="meta"></span></div>
+          <div class="wechat-management-grid">
+            <form id="wechat-profile-form" class="panel form-grid">
+              <h2 class="span-2">账号资料</h2>
+              <label>微信昵称<input name="nickname" maxlength="32" placeholder="只填写需要修改的字段"></label>
+              <label>个性签名<input name="signature" maxlength="120"></label>
+              <label>性别<select name="sex"><option value="">保持不变</option><option value="0">未设置</option><option value="1">男</option><option value="2">女</option></select></label>
+              <label>城市<input name="city" maxlength="64"></label>
+              <label>省份<input name="province" maxlength="64"></label>
+              <label>国家<input name="country" maxlength="32"></label>
+              <div class="form-actions span-2"><button class="primary" type="submit">保存账号资料</button></div>
+            </form>
+            <div class="panel">
+              <h2>头像与二维码</h2>
+              <label>上传头像（JPEG / PNG / WebP，最大 5 MiB）<input id="wechat-avatar-file" type="file" accept="image/jpeg,image/png,image/webp"></label>
+              <img id="wechat-avatar-preview" class="avatar-preview" alt="头像预览" hidden>
+              <div class="actions left-actions"><button id="wechat-avatar-upload" class="primary" type="button">上传头像</button><button id="wechat-qrcode-load" class="ghost" type="button">获取二维码</button></div>
+              <div id="wechat-qrcode-result" class="protocol-result"></div>
+            </div>
+          </div>
+          <details class="panel"><summary>协议返回的账号资料</summary><pre id="wechat-profile-raw" class="protocol-json"></pre></details>
+        </section>
+
+        <section id="view-contacts" class="view">
+          <div class="section-head"><div><h1>联系人与标签</h1><p>只提供查看、搜索、备注、通过请求和标签维护；不接通讯录上传和批量加删好友。</p></div><button id="refresh-contacts" class="ghost" type="button">刷新</button></div>
+          <div class="panel wechat-toolbar"><label>iPad 机器人<select id="contacts-bot"></select></label></div>
+          <div class="wechat-management-grid">
+            <form id="contact-search-form" class="panel form-grid"><h2 class="span-2">搜索与备注</h2><label class="span-2">微信号/手机号/QQ<input name="query" maxlength="64" required></label><div class="form-actions span-2"><button class="ghost" type="submit">搜索</button></div><label>联系人 wxid<input name="contactId" maxlength="300"></label><label>新备注<input name="remarks" maxlength="64"></label><div class="form-actions span-2"><button id="contact-remark-save" class="primary" type="button">保存备注</button></div><pre id="contact-search-result" class="protocol-json span-2"></pre></form>
+            <form id="label-form" class="panel form-grid"><h2 class="span-2">标签维护</h2><label>标签 ID<input name="labelId"></label><label>标签名称<input name="name" maxlength="32"></label><label class="span-2">成员 wxid（逗号或换行分隔）<textarea name="contactIds" rows="3"></textarea></label><div class="form-actions span-2"><button data-label-action="add" class="ghost" type="button">新增</button><button data-label-action="rename" class="ghost" type="button">改名</button><button data-label-action="members" class="ghost" type="button">更新成员</button><button data-label-action="delete" class="danger" type="button">删除</button></div><pre id="labels-result" class="protocol-json span-2"></pre></form>
+          </div>
+          <details class="panel" open><summary>通讯录协议数据</summary><pre id="contacts-result" class="protocol-json"></pre></details>
+        </section>
+
+        <section id="view-moments" class="view">
+          <div class="section-head"><div><h1>朋友圈</h1><p>发布必须由管理员在这里手动确认；这里只接文本朋友圈、点赞和评论，不提供自动发布。</p></div><button id="refresh-moments" class="ghost" type="button">刷新</button></div>
+          <div class="panel wechat-toolbar"><label>iPad 机器人<select id="moments-bot"></select></label></div>
+          <div class="wechat-management-grid">
+            <form id="moment-publish-form" class="panel form-grid"><h2 class="span-2">手动发布文本朋友圈</h2><label class="span-2">内容<textarea name="content" rows="6" maxlength="2000" required></textarea></label><label>可见范围<select name="privacy"><option value="public">公开</option><option value="private">私密</option></select></label><div class="form-actions span-2"><button class="primary" type="submit">确认并发布</button></div></form>
+            <form id="moment-interaction-form" class="panel form-grid"><h2 class="span-2">点赞 / 评论</h2><label class="span-2">朋友圈 ID（按字符串处理，避免 64 位精度丢失）<input name="momentId" inputmode="numeric" pattern="[0-9]+" required></label><label class="span-2">评论内容<textarea name="content" rows="3" maxlength="500"></textarea></label><div class="form-actions span-2"><button data-moment-action="like" class="ghost" type="button">点赞</button><button data-moment-action="comment" class="primary" type="button">评论</button></div><p class="span-2 warning-box">手动互动会二次确认；下方自动策略必须使用作者白名单、每日上限、最小间隔和审计日志。</p></form>
+          </div>
+          <form id="moment-automation-form" class="panel form-grid">
+            <div class="span-2"><h2>自动点赞 / 评论策略</h2><p>默认关闭且默认 dry-run。只处理明确白名单作者在回看窗口内的新朋友圈；发布朋友圈永远不会自动化。</p></div>
+            <label class="check"><input name="enabled" type="checkbox">启用自动互动</label>
+            <label class="check"><input name="dryRun" type="checkbox" checked>Dry-run（只记录，不实际点赞/评论）</label>
+            <label class="check"><input name="autoLike" type="checkbox">自动点赞</label>
+            <label class="check"><input name="autoComment" type="checkbox">自动评论</label>
+            <label class="span-2">允许互动的作者 wxid（逗号或换行，必填白名单）<textarea name="allowedAuthorWxids" rows="3" placeholder="wxid_friend_a&#10;wxid_friend_b"></textarea></label>
+            <label>每日总动作上限<input name="maxActionsPerDay" type="number" min="1" max="100" value="5" required></label>
+            <label>最小动作间隔（分钟）<input name="minIntervalMinutes" type="number" min="1" max="1440" value="30" required></label>
+            <label>只处理最近（分钟）<input name="lookbackMinutes" type="number" min="10" max="1440" value="180" required></label>
+            <label class="span-2">评论模板（每行一条；自动评论时必填）<textarea name="commentTemplates" rows="3" maxlength="10000" placeholder="看到啦～&#10;抱抱你，今天也辛苦了"></textarea></label>
+            <div class="form-actions span-2"><button class="primary" type="submit">保存自动互动策略</button></div>
+            <pre id="moment-automation-actions" class="protocol-json span-2"></pre>
+          </form>
+          <details class="panel" open><summary>最新朋友圈协议数据</summary><pre id="moments-result" class="protocol-json"></pre></details>
+        </section>
+
+        <section id="view-participation" class="view">
+          <div class="section-head"><div><h1>对话质量学习</h1><p>同时评价“该不该开口”和“回复有没有帮助”；评分只用于策略评测，不保存模型思维链。</p></div><div class="actions"><button id="export-participation" class="ghost" type="button">导出评测集</button><button id="prune-participation" class="ghost" type="button">按策略清理</button></div></div>
+          <div class="panel participation-filters">
+            <label>机器人<select id="participation-bot"></select></label>
+            <label>评分状态<select id="participation-review"><option value="unrated">待评分</option><option value="all">全部</option><option value="speak">应该说</option><option value="silent">不该说</option><option value="unsure">不确定</option></select></label>
+            <label>回复质量<select id="participation-quality-review"><option value="all">全部</option><option value="unrated">待评价回复</option><option value="helpful">有帮助</option><option value="unhelpful">需改进</option><option value="unsure">不确定</option></select></label>
+            <label>群聊 ID（可空）<input id="participation-conversation" placeholder="room@chatroom"></label>
+            <button id="refresh-participation" class="ghost" type="button">刷新案例</button>
+          </div>
+          <div id="participation-stats" class="stats participation-stats"></div>
+          <div id="participation-list" class="participation-list"></div>
+        </section>
+
+        <section id="view-providers" class="view">
+          <div class="section-head"><div><h1>Provider</h1><p>管理多个模型服务账户；API Key 加密保存且不会回传到浏览器。</p></div><button id="add-provider" class="primary" type="button">新增 Provider</button></div>
+          <div id="providers-list" class="stack"></div>
+        </section>
+
+        <section id="view-knowledge" class="view">
+          <div class="section-head"><div><h1>联网检索</h1><p>Pi 只在时效、精确或陌生事实需要查证时调用，结果作为不可信证据处理。</p></div><button id="add-knowledge-provider" class="primary" type="button">新增检索源</button></div>
+          <div id="knowledge-providers-list" class="stack"></div>
+        </section>
+
+        <section id="view-mcp" class="view">
+          <div class="section-head"><div><h1>MCP 服务</h1><p>管理标准 Streamable HTTP MCP 接口；密钥加密保存，模型只发送单次工具参数。</p></div><button id="add-mcp-server" class="primary" type="button">新增 MCP</button></div>
+          <div id="mcp-servers-list" class="stack"></div>
+        </section>
+
+        <section id="view-settings" class="view">
+          <div class="section-head"><div><h1>全局设置</h1><p>机器人未单独指定时继承这里的模型。</p></div></div>
+          <form id="settings-form" class="panel form-grid narrow">
+            <label>默认聊天模型<select name="defaultChatModelProfileId"></select></label>
+            <label>默认视觉模型<select name="defaultVisionModelProfileId"></select></label>
+            <label>默认联网检索<select name="defaultKnowledgeProfileId"></select></label>
+            <label>全局默认人设<select name="defaultPersonaProfileId"></select></label>
+            <label>日志保留天数<input name="logRetentionDays" type="number" min="1" max="365" required></label>
+            <label>最大日志行数<input name="maxLogRows" type="number" min="1000" max="1000000" required></label>
+            <label>页面刷新间隔（毫秒）<input name="statusRefreshMs" type="number" min="1000" max="60000" required></label>
+            <label>未评分案例保留天数<input name="participationRetentionDays" type="number" min="1" max="3650" required></label>
+            <label>每 Bot 最大案例数<input name="maxParticipationCasesPerBot" type="number" min="1000" max="1000000" required></label>
+            <div class="form-actions"><button class="primary" type="submit">保存并应用</button></div>
+          </form>
+        </section>
+
+        <section id="view-logs" class="view">
+          <div class="section-head"><div><h1>日志</h1><p>结构化生命周期、错误和配置审计。</p></div><button id="prune-logs" class="ghost" type="button">立即清理</button></div>
+          <div class="panel filters">
+            <select id="log-level"><option value="">全部级别</option><option>debug</option><option>info</option><option>warn</option><option>error</option></select>
+            <select id="log-bot"><option value="">全部机器人</option></select>
+            <input id="log-query" type="search" placeholder="搜索 event 或消息">
+            <button id="refresh-logs" class="ghost" type="button">查询</button>
+            <label class="check log-follow"><input id="log-follow" type="checkbox" checked>自动跟随最新</label>
+          </div>
+          <div id="logs-list" class="log-list"></div>
+          <div class="log-more"><button id="load-more-logs" class="ghost" type="button" hidden>加载更早日志</button></div>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="login-dialog" class="dialog compact" aria-labelledby="login-title">
+      <form id="login-form" class="dialog-body">
+        <div><div class="brand"><span class="brand-dot"></span><span id="login-title">管理验证</span></div><p>输入 data/admin-token.txt 中的 Token。</p></div>
+        <label>Admin Token<input name="token" type="password" autocomplete="current-password" minlength="24" required autofocus></label>
+        <p id="login-error" class="error-text"></p>
+        <button class="primary wide" type="submit">进入控制台</button>
+      </form>
+    </dialog>
+
+    <dialog id="chatroom-dialog" class="dialog chatroom-dialog chatroom-manager-dialog" aria-labelledby="chatroom-dialog-title">
+      <div class="dialog-body chatroom-dialog-body">
+        <div class="dialog-head">
+          <div><h2 id="chatroom-dialog-title">群聊历史</h2><p id="chatroom-dialog-meta"></p></div>
+          <button class="icon close-dialog" type="button" aria-label="关闭">×</button>
+        </div>
+        <div class="chatroom-tabs" role="tablist" aria-label="群聊管理栏目">
+          <button class="chatroom-tab active" data-chatroom-tab="config" type="button">配置</button>
+          <button class="chatroom-tab" data-chatroom-tab="tasks" type="button">定时任务</button>
+          <button class="chatroom-tab" data-chatroom-tab="memories" type="button">持久记忆</button>
+          <button class="chatroom-tab" data-chatroom-tab="wechat" type="button">微信群设置</button>
+          <button class="chatroom-tab" data-chatroom-tab="history" type="button">历史与发送</button>
+        </div>
+
+        <section id="chatroom-tab-config" class="chatroom-tab-panel active"></section>
+
+        <section id="chatroom-tab-tasks" class="chatroom-tab-panel">
+          <div class="subsection-head"><div><h3>本群定时任务</h3><p>这里只显示和管理当前机器人在当前群创建的任务。</p></div><span id="chatroom-task-count" class="pill muted">0 个</span></div>
+          <div id="chatroom-tasks-list" class="scheduled-task-list dense-task-list"></div>
+        </section>
+
+        <section id="chatroom-tab-memories" class="chatroom-tab-panel">
+          <div class="subsection-head"><div><h3>本群持久记忆</h3><p>包含群级事实、专属梗，以及仅在本群生效的人物记忆。</p></div><span id="chatroom-memory-count" class="pill muted">0 条</span></div>
+          <form id="chatroom-memory-form" class="memory-create-form">
+            <label>作用范围<select name="scope"><option value="conversation">整个群聊</option><option value="person">指定群友</option></select></label>
+            <label class="memory-person-field" hidden>群友<select name="personId"></select></label>
+            <label>类型<input name="kind" value="fact" maxlength="80" placeholder="fact / preference / inside-joke" required></label>
+            <label>重要度<input name="importance" type="number" min="0" max="1" step="0.1" value="0.7" required></label>
+            <label>有效期<select name="expiresInDays"><option value="">长期有效</option><option value="30">30 天</option><option value="90">90 天</option><option value="365">1 年</option></select></label>
+            <label class="memory-content-field">记忆内容<textarea name="content" rows="2" maxlength="1000" placeholder="输入机器人应长期记住的明确事实" required></textarea></label>
+            <button class="primary" type="submit">新增记忆</button>
+          </form>
+          <div id="chatroom-memories-list" class="memory-list"></div>
+          <details class="memory-audit"><summary>查看最近记忆审计</summary><div id="chatroom-memory-audit" class="memory-audit-list"></div></details>
+        </section>
+
+        <section id="chatroom-tab-wechat" class="chatroom-tab-panel">
+          <div class="subsection-head"><div><h3>微信群原生设置</h3><p>群名称、群公告均为管理员手动操作；不包含“群公告助手”或自动发布。</p></div><button id="chatroom-wechat-refresh" class="ghost small" type="button">读取群资料</button></div>
+          <p id="chatroom-group-nickname-status" class="warning-box"></p>
+          <div class="wechat-management-grid">
+            <form id="chatroom-wechat-settings-form" class="panel form-grid"><label>操作<select name="operation"><option value="remarks">仅自己可见的群备注</option><option value="name">群名称</option><option value="announcement">群公告（手动）</option></select></label><label class="span-2">内容<textarea name="value" rows="4" maxlength="2000"></textarea></label><div class="form-actions span-2"><button class="primary" type="submit">确认修改</button><button id="chatroom-group-qrcode" class="ghost" type="button">获取群二维码</button></div></form>
+            <form id="chatroom-wechat-members-form" class="panel form-grid"><label>成员操作<select name="action"><option value="add">直接加入（40 人内）</option><option value="invite">邀请（40 人以上）</option><option value="remove">移出群聊</option></select></label><label class="span-2">成员 wxid（逗号或换行）<textarea name="memberIds" rows="3" required></textarea></label><div class="form-actions span-2"><button class="primary" type="submit">执行成员操作</button></div><label>管理员操作<select name="adminAction"><option value="add">添加管理员</option><option value="remove">移除管理员</option><option value="transfer">转让群主</option></select></label><div class="form-actions span-2"><button id="chatroom-wechat-admin" class="danger" type="button">执行管理员操作</button></div></form>
+          </div>
+          <pre id="chatroom-wechat-result" class="protocol-json"></pre>
+        </section>
+
+        <section id="chatroom-tab-history" class="chatroom-tab-panel history-panel">
+          <div class="chat-history-toolbar">
+            <button id="chatroom-load-earlier" class="ghost small" type="button">加载更早消息</button>
+            <span id="chatroom-history-status" class="meta"></span>
+          </div>
+          <div id="chatroom-messages" class="chatroom-messages" aria-live="polite"></div>
+          <form id="chatroom-send-form" class="chatroom-send-form">
+            <label>发送机器人<select id="chatroom-send-bot" required></select></label>
+            <label>主动发送文字
+              <textarea id="chatroom-send-text" rows="3" maxlength="4000" placeholder="输入文字，或在下方选择一个表情包……"></textarea>
+            </label>
+            <details id="chatroom-send-emoji-panel" class="chatroom-send-emoji-panel">
+              <summary>从表情包库选择素材</summary>
+              <div class="chatroom-send-emoji-toolbar">
+                <input id="chatroom-send-emoji-search" type="search" placeholder="搜索情绪、动作或使用场景">
+                <button id="chatroom-send-emoji-clear" class="ghost small" type="button" hidden>清除选择</button>
+                <span id="chatroom-send-emoji-status" class="meta">未选择表情包</span>
+              </div>
+              <div id="chatroom-send-emoji-picker" class="chatroom-send-emoji-picker"></div>
+            </details>
+            <div class="chatroom-send-actions">
+              <span class="meta">发送前会再次确认，不调用模型。</span>
+              <button class="primary" type="submit">发送到群聊</button>
+            </div>
+          </form>
+        </section>
+      </div>
+    </dialog>
+
+    <dialog id="provider-dialog" class="dialog" aria-labelledby="provider-dialog-title">
+      <form id="provider-form" class="dialog-body form-grid">
+        <div class="dialog-head span-2"><div><h2 id="provider-dialog-title">Provider 配置</h2><p>API Key 使用 AES-256-GCM 加密保存，编辑时留空表示保留原值。</p></div><button class="icon close-dialog" type="button" aria-label="关闭">×</button></div>
+        <label>配置 ID<input name="id" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" required></label>
+        <label>显示名称<input name="label" required></label>
+        <label>Provider 标识（自定义）<input name="provider" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" placeholder="my-openai / local-llm / xai" required></label>
+        <label>模型列表/默认协议<select name="api" required><option value="auto">自动探测</option><option value="openai-completions">OpenAI Chat Completions / Grok</option><option value="openai-responses">OpenAI Responses</option><option value="google-generative-ai">Google Gemini</option><option value="anthropic-messages">Anthropic Messages</option></select></label>
+        <label>API Key<input name="apiKey" type="password" autocomplete="new-password" placeholder="新建时填写；编辑留空则保留"></label>
+        <label class="span-2">Base URL<input name="baseUrl" type="url" placeholder="https://api.openai.com/v1" required></label>
+        <details class="span-2 advanced"><summary>环境变量兼容</summary><div class="form-grid nested">
+          <label class="span-2">API Key 环境变量（可空）<input name="apiKeyEnv" placeholder="ANTHROPIC_API_KEY" pattern="[A-Z_][A-Z0-9_]*"></label>
+        </div></details>
+        <label class="check"><input name="enabled" type="checkbox" checked>启用此 Provider</label>
+        <label class="check"><input name="clearApiKey" type="checkbox">清除已保存的 API Key</label>
+        <p id="provider-probe-result" class="span-2 probe-result"></p>
+        <div class="form-actions span-2"><button id="provider-probe" class="ghost" type="button">测试并拉取模型</button><button class="ghost close-dialog" type="button">取消</button><button class="primary" type="submit">保存并应用</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="persona-dialog" class="dialog" aria-labelledby="persona-dialog-title">
+      <form id="persona-form" class="dialog-body form-grid">
+        <div class="dialog-head span-2"><div><h2 id="persona-dialog-title">人设配置</h2><p>人设内容作为系统提示词使用；群聊选择后无需重启机器人。</p></div><button class="icon close-dialog" type="button" aria-label="关闭">×</button></div>
+        <label>人设 ID<input name="id" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" required></label>
+        <label>显示名称<input name="label" maxlength="120" required></label>
+        <label>微信账号昵称<input name="accountNickname" maxlength="32" placeholder="切换时可同步到全局账号"></label>
+        <label>群内昵称预设<input name="groupNickname" maxlength="32" placeholder="874 暂不支持原生同步"></label>
+        <label class="span-2">额外唤醒词<input name="wakeWords" maxlength="500" placeholder="逗号或换行分隔；切换人设后立即生效"></label>
+        <label class="span-2">头像预设（管理员上传，最大 5 MiB）<input name="avatarFile" type="file" accept="image/jpeg,image/png,image/webp"><img id="persona-avatar-preview" class="avatar-preview" alt="人设头像预览" hidden></label>
+        <label class="check"><input name="removeAvatar" type="checkbox">移除已保存头像</label>
+        <label class="check"><input name="autoApplyAccountProfile" type="checkbox">切换人设时同步全局微信昵称/头像</label>
+        <p class="span-2 warning-box">微信账号昵称和头像是全局资料，会影响该账号所在的全部群；群内昵称需等待 874 暴露 CmdID 48 后才能同步。</p>
+        <label class="span-2">人设提示词<textarea name="prompt" rows="12" maxlength="20000" placeholder="描述身份、性格、说话方式和边界" required></textarea></label>
+        <label class="check"><input name="enabled" type="checkbox" checked>允许群聊选择和命令切换</label>
+        <div class="form-actions span-2"><button class="ghost close-dialog" type="button">取消</button><button class="primary" type="submit">保存人设</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="model-dialog" class="dialog" aria-labelledby="model-dialog-title">
+      <form id="model-form" class="dialog-body form-grid">
+        <div class="dialog-head span-2"><div><h2 id="model-dialog-title">模型配置</h2><p>可以从 Provider 拉取，也可以直接手动填写模型 ID；能力参数会尽量自动补全。</p></div><button class="icon close-dialog" type="button" aria-label="关闭">×</button></div>
+        <label>配置 ID<input name="id" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" required></label>
+        <label>显示名称<input name="label" required></label>
+        <label>Provider 配置<select name="providerProfileId" required></select></label>
+        <label>Model ID<input name="modelId" list="model-id-options" placeholder="gpt-5 / claude… / 本地模型名" required><datalist id="model-id-options"></datalist></label>
+        <label class="span-2">此模型的接口协议<select name="api" required><option value="auto" selected>自动识别并测试候选协议</option><option value="inherit">继承 Provider 默认协议</option><option value="openai-completions">OpenAI Chat Completions / Grok</option><option value="openai-responses">OpenAI Responses</option><option value="google-generative-ai">Google Gemini 原生协议</option><option value="anthropic-messages">Anthropic Messages 原生协议</option></select></label>
+        <label>Thinking<select name="thinkingLevel"><option>off</option><option>minimal</option><option selected>low</option><option>medium</option><option>high</option><option>xhigh</option></select></label>
+        <label>最大重试等待（毫秒）<input name="maxRetryDelayMs" type="number" min="0" max="600000" value="60000" required></label>
+        <details class="span-2 advanced" open><summary>模型能力</summary><div class="form-grid nested">
+          <label>上下文窗口<input name="contextWindow" type="number" min="1024" max="10000000" value="128000" required></label>
+          <label>最大输出 Token<input name="maxTokens" type="number" min="1" max="1000000" value="8192" required></label>
+          <label class="span-2">OpenAI Thinking 兼容格式<select name="openaiThinkingFormat"><option value="">自动检测</option><option value="qwen-chat-template">Qwen llama.cpp（chat_template_kwargs）</option><option value="qwen">Qwen API（enable_thinking）</option><option value="zai">Z.ai</option><option value="deepseek">DeepSeek</option><option value="openrouter">OpenRouter</option><option value="together">Together</option><option value="openai">OpenAI</option></select></label>
+          <label class="check"><input name="reasoning" type="checkbox">推理模型</label>
+          <label class="check"><input name="supportsImages" type="checkbox">支持图片输入</label>
+        </div></details>
+        <label class="check"><input name="enabled" type="checkbox" checked>启用此模型</label>
+        <p id="model-test-result" class="span-2 probe-result"></p>
+        <div class="form-actions span-2"><button id="model-text-test" class="ghost" type="button">测试文本</button><button id="model-image-test" class="ghost" type="button">测试图片</button><button class="ghost close-dialog" type="button">取消</button><button class="primary" type="submit">保存并应用</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="knowledge-provider-dialog" class="dialog" aria-labelledby="knowledge-provider-dialog-title">
+      <form id="knowledge-provider-form" class="dialog-body form-grid">
+        <div class="dialog-head span-2"><div><h2 id="knowledge-provider-dialog-title">联网检索配置</h2><p>SearXNG 可无 Key；Brave 与 Tavily 的 Key 会加密保存。</p></div><button class="icon close-dialog" type="button" aria-label="关闭">×</button></div>
+        <label>配置 ID<input name="id" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" required></label>
+        <label>显示名称<input name="label" required></label>
+        <label>检索协议<select name="kind" required><option value="searxng">SearXNG</option><option value="brave">Brave Search API</option><option value="tavily">Tavily</option></select></label>
+        <label>最大结果数<input name="maxResults" type="number" min="1" max="8" value="5" required></label>
+        <label class="span-2">Base URL<input name="baseUrl" type="url" value="http://searxng:8080" required></label>
+        <label>API Key<input name="apiKey" type="password" autocomplete="new-password" placeholder="编辑留空则保留"></label>
+        <label>超时（毫秒）<input name="timeoutMs" type="number" min="500" max="60000" value="12000" required></label>
+        <details class="span-2 advanced"><summary>环境变量兼容</summary><div class="form-grid nested"><label class="span-2">API Key 环境变量（可空）<input name="apiKeyEnv" pattern="[A-Z_][A-Z0-9_]*"></label></div></details>
+        <label class="check"><input name="enabled" type="checkbox" checked>启用此检索源</label>
+        <label class="check"><input name="clearApiKey" type="checkbox">清除已保存的 API Key</label>
+        <p id="knowledge-provider-probe-result" class="span-2 probe-result"></p>
+        <div class="form-actions span-2"><button id="knowledge-provider-probe" class="ghost" type="button">测试搜索</button><button class="ghost close-dialog" type="button">取消</button><button class="primary" type="submit">保存并应用</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="mcp-server-dialog" class="dialog" aria-labelledby="mcp-server-dialog-title">
+      <form id="mcp-server-form" class="dialog-body form-grid">
+        <div class="dialog-head span-2"><div><h2 id="mcp-server-dialog-title">MCP 服务</h2><p>当前支持 Streamable HTTP；不会执行服务器端 stdio 命令。</p></div><button class="icon close-dialog" type="button" aria-label="关闭">×</button></div>
+        <label>服务 ID<input name="id" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" required></label>
+        <label>显示名称<input name="label" maxlength="120" required></label>
+        <label class="span-2">MCP URL<input name="url" type="url" placeholder="https://example.com/mcp" required></label>
+        <label>鉴权方式<select name="authType"><option value="none">无鉴权</option><option value="bearer">Bearer Token</option><option value="api-key">API Key Header</option></select></label>
+        <label>鉴权 Header<input name="authHeader" value="Authorization" placeholder="Authorization / X-API-Key"></label>
+        <label class="span-2">密钥<input name="secret" type="password" autocomplete="new-password" placeholder="编辑留空则保留原密钥"></label>
+        <label class="span-2">附加 Headers（JSON，可空）<textarea name="headers" rows="4" placeholder='{"X-Tenant":"team-a"}'></textarea></label>
+        <label>超时（毫秒）<input name="timeoutMs" type="number" min="500" max="60000" value="15000" required></label>
+        <label>最多暴露工具数<input name="maxTools" type="number" min="1" max="40" value="20" required></label>
+        <label class="check"><input name="enabled" type="checkbox" checked>启用并暴露给模型</label>
+        <label class="check"><input name="clearSecret" type="checkbox">清除已保存密钥</label>
+        <pre id="mcp-server-probe-result" class="span-2 probe-result"></pre>
+        <div class="form-actions span-2"><button id="mcp-server-probe" class="ghost" type="button">测试并列出工具</button><button class="ghost close-dialog" type="button">取消</button><button class="primary" type="submit">保存并应用</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="bot-dialog" class="dialog wide-dialog" aria-labelledby="bot-dialog-title">
+      <form id="bot-form" class="dialog-body form-grid">
+        <div class="dialog-head span-2"><div><h2 id="bot-dialog-title">机器人配置</h2><p>密钥字段填写容器环境变量名。</p></div><button class="icon close-dialog" type="button" aria-label="关闭">×</button></div>
+        <h3 class="span-2 group-title">身份与模型</h3>
+        <label>配置 ID<input name="id" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" required></label>
+        <label>微信机器人 ID<input name="identityId" required></label>
+        <label>显示名称<input name="displayName" required></label>
+        <label>群聊激活<select name="defaultGroupActivation"><option value="mention">mention</option><option value="always">always</option><option value="off">off</option></select></label>
+        <label>聊天模型<select name="chatModelProfileId"></select></label>
+        <label>简单任务低成本模型<select name="fastChatModelProfileId"></select><small>短问候和简单聊天优先走此模型；分析、总结、文件和工具任务仍走主模型。</small></label>
+        <label>群聊接话判断模型<select name="participationJudgeModelProfileId"></select><small>只判断模糊群聊是否需要接话；不生成最终文本、图片或语音，失败时保守静默。</small></label>
+        <label class="span-2">跨 Provider 降级链（每行一个模型配置 ID）<textarea name="fallbackChatModelProfileIds" rows="3" placeholder="gpt-fallback&#10;local-fallback"></textarea><small>主模型为 Gemini 时，会先轮转同一 AIStudio Provider 下更低优先级的 Gemini，再按这里的顺序降级。</small></label>
+        <label>视觉模型<select name="visionModelProfileId"></select></label>
+        <label class="span-2">唤醒词（逗号分隔）<input name="wakeWords" placeholder="小派, 派派"></label>
+        <label class="span-2">管理员 ID（逗号分隔）<input name="operatorIds"></label>
+        <label class="span-2">Bot 默认人设<select name="personaProfileId"></select></label>
+        <label class="check"><input name="enabled" type="checkbox">保存后启动</label>
+        <label class="check"><input name="imageUnderstandingEnabled" type="checkbox" checked>启用按需看图</label>
+
+        <details class="span-2 advanced" open><summary>主动参与与正常作息</summary><div class="form-grid nested">
+          <label class="check"><input name="socialScheduleEnabled" type="checkbox">启用热群、冷群与作息调度</label>
+          <label>时区 UTC 偏移（分钟）<input name="timezoneOffsetMinutes" type="number" min="-720" max="840" value="480"></label>
+          <label>日间开始<input name="activeStartTime" type="time" value="07:00"></label>
+          <label>日间结束<input name="activeEndTime" type="time" value="23:00"></label>
+          <label>热群窗口（分钟）<input name="hotChatWindowMinutes" type="number" min="1" max="30" value="3"></label>
+          <label>热群消息阈值<input name="hotChatMinMessages" type="number" min="3" max="100" value="10"></label>
+          <label>热群参与人数<input name="hotChatMinParticipants" type="number" min="2" max="30" value="4"></label>
+          <label>主动参与冷却（分钟）<input name="hotChatCooldownMinutes" type="number" min="1" max="1440" value="30"></label>
+          <label>冷群等待（小时）<input name="coldChatAfterHours" type="number" min="1" max="720" value="4"></label>
+          <label>同群暖场冷却（小时）<input name="coldChatCooldownHours" type="number" min="1" max="720" value="24"></label>
+          <label>每日主动暖场上限<input name="maxDailyAmbientMessages" type="number" min="0" max="100" value="3"></label>
+          <label>活跃群最低消息数<input name="activeGroupMinMessages" type="number" min="1" max="1000" value="5"></label>
+          <label class="check"><input name="goodnightEnabled" type="checkbox" checked>向当日活跃群说晚安</label>
+          <label>晚安时间<input name="goodnightTime" type="time" value="23:00"></label>
+          <p class="span-2 channel-note">夜间仍响应 @、引用回复与明确唤醒词；普通提问、热群插话和定时暖场会静默。重叠群由所有 Bot 共享限频锁。</p>
+        </div></details>
+
+        <h3 id="channel-section-title" class="span-2 group-title">Channel 接入</h3>
+        <label>Channel 类型<select name="channelType"><option value="wx-hook-http">wx_hook_bridge HTTP</option><option value="wechat-ipad">WeChat iPad 原始协议</option></select></label>
+        <label>账号命名空间（可空）<input name="accountId" placeholder="用于多账号 ID 隔离"></label>
+
+        <div class="span-2 form-grid channel-fields" data-channel-fields="wx-hook-http">
+          <label class="span-2">Gateway Base URL<input name="gatewayBaseUrl" type="url" value="http://192.168.31.200:8080" required></label>
+          <label>API Token 环境变量<input name="apiTokenEnv" value="WX_HOOK_API_TOKEN" required></label>
+          <label>Gateway 超时（毫秒）<input name="gatewayTimeoutMs" type="number" value="10000" required></label>
+          <label>Webhook 监听地址<input name="webhookHost" value="0.0.0.0" required></label>
+          <label>Webhook 端口<input name="webhookPort" type="number" min="1024" max="65535" value="9000" required></label>
+          <label>Webhook 路径<input name="webhookPath" value="/wechat/events" required></label>
+          <label>Webhook Secret 环境变量<input name="webhookSecretEnv" value="WX_HOOK_WEBHOOK_SECRET" required></label>
+          <label class="check"><input name="nativeQuoteReplies" type="checkbox" checked>原生引用回复</label>
+          <label class="check"><input name="acceptUnknownGroupSenders" type="checkbox" checked>接受降级群成员身份</label>
+        </div>
+
+        <div class="span-2 form-grid channel-fields" data-channel-fields="wechat-ipad" hidden>
+          <label class="span-2">原始 API Base URL<input name="ipadApiBaseUrl" type="url" value="http://wechat-ipad-874-api:8062/api"></label>
+          <label>登录账号 wxid<input name="ipadAccountWxid" placeholder="wxid_..."></label>
+          <label>API Token 环境变量（可空）<input name="ipadApiTokenEnv"></label>
+          <label>API 超时（毫秒）<input name="ipadApiTimeoutMs" type="number" value="35000"></label>
+          <label>回调监听地址<input name="ipadCallbackHost" value="0.0.0.0"></label>
+          <label>回调端口<input name="ipadCallbackPort" type="number" min="1024" max="65535" value="9001"></label>
+          <label class="span-2">回调路径前缀<input name="ipadCallbackPathPrefix" value="/api/v1/wechat-client"></label>
+          <label class="span-2">允许来源 IP/CIDR（逗号或换行）<textarea name="ipadCallbackAllowedSourceIps" rows="2">172.23.0.0/16</textarea></label>
+          <label>回调最大 Body（字节）<input name="ipadCallbackMaxBodyBytes" type="number" value="16777216"></label>
+          <label>重注册间隔（毫秒）<input name="ipadRegisterIntervalMs" type="number" value="60000"></label>
+          <label class="span-2">Callback Router URL<input name="ipadCallbackRouterBaseUrl" type="url" value="http://wechat-874-callback-router:9000"></label>
+          <label>Router 可访问的 Agent 主机名<input name="ipadCallbackAdvertiseHost" value="pi-wechat-agent"></label>
+          <label class="check"><input name="ipadAutoRegisterCallback" type="checkbox" checked>启动后自动注册并续租回调</label>
+          <p class="span-2 channel-note">微信登录由当前 Agent WebUI 完整管理；在线账号不会被重复取码。新建未登录配置时可先使用 wxid_pending，扫码成功后会自动写回真实 wxid。</p>
+        </div>
+        <label>入站失败重试（毫秒）<input name="ingestRetryMs" type="number" value="2000" required></label>
+
+        <details class="span-2 advanced"><summary>高级限制</summary><div class="form-grid nested">
+          <label>历史条数<input name="historyLimit" type="number"></label><label>历史字符<input name="maxHistoryChars" type="number"></label>
+          <label>记忆条数<input name="memoryLimit" type="number"></label><label>行为条数<input name="behaviorLimit" type="number"></label>
+          <label>回复字符<input name="maxReplyChars" type="number"></label><label>续聊窗口 ms<input name="continuationWindowMs" type="number"></label>
+          <label>普通群聊合并窗口 ms<input name="messageBurstDebounceMs" type="number" min="0" max="30000"><small>同一成员未明确叫机器人时，建议 5000–10000。</small></label>
+          <label>明确叫机器人合并窗口 ms<input name="explicitMessageBurstDebounceMs" type="number" min="0" max="5000"><small>@、引用机器人或唤醒词使用较短窗口。</small></label>
+          <label>每轮最大 LLM 调用<input name="maxAgentLlmCalls" type="number" min="1" max="30"></label>
+          <label>每轮最大工具调用<input name="maxAgentToolCalls" type="number" min="0" max="50"></label>
+          <label>Agent 总超时 ms<input name="agentTimeoutMs" type="number" min="5000" max="600000"></label>
+          <label>单图字节<input name="maxImageBytes" type="number"></label><label>每轮看图次数<input name="maxImageUnderstandingCalls" type="number"></label>
+          <label>视觉证据字符<input name="maxImageEvidenceChars" type="number"></label><label>视觉超时 ms<input name="imageUnderstandingTimeoutMs" type="number"></label>
+          <label>近期图片消息数<input name="imageContextMessageLimit" type="number"></label><label>近期图片窗口 ms<input name="imageContextWindowMs" type="number"></label>
+          <label>候选图片数<input name="maxAvailableImagesPerTurn" type="number"></label>
+        </div></details>
+        <div class="form-actions span-2"><button class="ghost close-dialog" type="button">取消</button><button class="primary" type="submit">保存并应用</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="ipad-login-dialog" class="dialog ipad-login-dialog" aria-labelledby="ipad-login-title">
+      <div class="dialog-body ipad-login-body">
+        <div class="dialog-head">
+          <div><span class="eyebrow">WECHAT SESSION</span><h2 id="ipad-login-title">微信登录</h2><p id="ipad-login-subtitle">wechat-ipad 登录状态</p></div>
+          <button class="icon close-dialog" type="button" aria-label="关闭">×</button>
+        </div>
+        <div class="login-status-card">
+          <div id="ipad-login-avatar" class="login-avatar">微</div>
+          <div class="login-identity"><strong id="ipad-login-account">正在检查登录态…</strong><span id="ipad-login-message">请稍候</span></div>
+          <span id="ipad-login-phase" class="pill starting">检查中</span>
+        </div>
+        <div id="ipad-login-qr-panel" class="qr-panel" hidden>
+          <div class="qr-frame"><img id="ipad-login-qr" alt="微信登录二维码"></div>
+          <p id="ipad-login-countdown">二维码准备中</p>
+          <a id="ipad-login-qr-link" class="qr-link" target="_blank" rel="noopener noreferrer" hidden>打开二维码内容</a>
+        </div>
+        <div id="ipad-login-start-panel" class="login-action-panel">
+          <label>登录设备
+            <select id="ipad-login-type">
+              <option value="ipad">iPad（推荐）</option>
+              <option value="win">Windows 微信</option>
+              <option value="mac">Mac 微信</option>
+              <option value="car">车载微信</option>
+              <option value="android-pad">Android Pad</option>
+            </select>
+          </label>
+          <button id="ipad-login-start" class="primary" type="button">生成登录二维码</button>
+        </div>
+        <div id="ipad-login-verify-panel" class="verify-panel" hidden>
+          <div><h3>安全验证</h3><p>手机若显示六位安全码，请在这里输入；没有安全码时可使用滑块。</p></div>
+          <form id="ipad-security-code-form" class="security-code-form">
+            <input id="ipad-security-code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000" aria-label="六位安全码" required>
+            <button class="primary" type="submit">提交安全码</button>
+          </form>
+          <button id="ipad-login-slider" class="ghost wide" type="button">打开滑块验证</button>
+        </div>
+        <iframe id="ipad-slider-frame" class="slider-frame" title="微信滑块验证" hidden></iframe>
+        <div class="login-foot">
+          <span>登录票据只保存在 Agent 内存，不写数据库和日志。</span>
+          <button id="ipad-login-cancel" class="ghost small" type="button">取消本次登录</button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog id="confirm-dialog" class="dialog confirm-dialog" aria-labelledby="confirm-title">
+      <div class="dialog-body confirm-body">
+        <h2 id="confirm-title">确认操作</h2>
+        <p id="confirm-text"></p>
+        <div class="form-actions confirm-actions">
+          <button id="confirm-cancel" class="ghost" type="button">取消</button>
+          <button id="confirm-ok" class="primary" type="button">确认</button>
+        </div>
+      </div>
+    </dialog>
+
+    <div id="toast-stack" class="toast-stack" role="status" aria-live="polite"></div>
+  </body>
+</html>

@@ -1,0 +1,20 @@
+FROM pi-wechat-agent-recovery-base:20260728
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+COPY dist ./dist
+COPY webui/dist ./webui
+
+RUN chmod -R a+rX /app/dist /app/webui
+
+ENV NODE_ENV=production \
+    PI_AGENT_DATA_DIR=/app/data
+
+VOLUME ["/app/data"]
+EXPOSE 8787 9000-9099
+
+HEALTHCHECK --interval=30s --timeout=4s --start-period=10s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:8787/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+
+CMD ["node", "dist/admin/main.js"]

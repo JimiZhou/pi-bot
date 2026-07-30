@@ -27,7 +27,6 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { Input } from "@/components/ui/input"
@@ -46,10 +45,6 @@ const pluginIcons = [BookOpenText, CalendarClock, Image, Sparkles]
 export function PluginsPanel({ plugins }: { plugins: PluginModule[] }) {
   const [query, setQuery] = useState("")
   const [category, setCategory] = useState("all")
-  const [enabled, setEnabled] = useState<Record<string, boolean>>(() =>
-    Object.fromEntries(plugins.map((plugin) => [plugin.id, plugin.enabled]))
-  )
-
   const normalizedQuery = query.trim().toLocaleLowerCase()
   const filteredPlugins = plugins.filter((plugin) => {
     const matchesQuery =
@@ -59,7 +54,7 @@ export function PluginsPanel({ plugins }: { plugins: PluginModule[] }) {
     const matchesCategory = category === "all" || plugin.category === category
     return matchesQuery && matchesCategory
   })
-  const enabledCount = Object.values(enabled).filter(Boolean).length
+  const enabledCount = plugins.filter((plugin) => plugin.enabled).length
 
   return (
     <div className="space-y-6">
@@ -68,9 +63,11 @@ export function PluginsPanel({ plugins }: { plugins: PluginModule[] }) {
         title="按需扩展 Bot 能力"
         description="插件封装工具和业务能力，并通过权限范围决定哪些 Bot 可以调用。"
         action={
-          <Button>
-            <PackagePlus data-icon="inline-start" />
-            安装插件
+          <Button asChild>
+            <a href="#plugins">
+              <PackagePlus data-icon="inline-start" />
+              管理插件
+            </a>
           </Button>
         }
       />
@@ -116,7 +113,7 @@ export function PluginsPanel({ plugins }: { plugins: PluginModule[] }) {
           {filteredPlugins.map((plugin) => {
             const originalIndex = plugins.findIndex((item) => item.id === plugin.id)
             const Icon = pluginIcons[originalIndex % pluginIcons.length] ?? LayoutGrid
-            const isEnabled = enabled[plugin.id] ?? false
+            const isEnabled = plugin.enabled
             return (
               <Card key={plugin.id} className="shadow-none">
                 <CardHeader>
@@ -141,10 +138,9 @@ export function PluginsPanel({ plugins }: { plugins: PluginModule[] }) {
                         </Button>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end">
-                        <DropdownMenuItem>配置插件</DropdownMenuItem>
-                        <DropdownMenuItem>查看调用日志</DropdownMenuItem>
-                        <DropdownMenuSeparator />
-                        <DropdownMenuItem variant="destructive">卸载插件</DropdownMenuItem>
+                        <DropdownMenuItem asChild>
+                          <a href="#plugins">在插件模块管理</a>
+                        </DropdownMenuItem>
                       </DropdownMenuContent>
                     </DropdownMenu>
                   </CardAction>
@@ -162,10 +158,8 @@ export function PluginsPanel({ plugins }: { plugins: PluginModule[] }) {
                     <span className="text-xs font-medium">{isEnabled ? "启用" : "停用"}</span>
                     <Switch
                       checked={isEnabled}
-                      onCheckedChange={(checked) =>
-                        setEnabled((current) => ({ ...current, [plugin.id]: checked }))
-                      }
-                      aria-label={`${isEnabled ? "停用" : "启用"}${plugin.name}`}
+                      disabled
+                      aria-label={`${plugin.name}当前${isEnabled ? "已启用" : "未启用"}，请在插件模块修改`}
                     />
                   </div>
                 </CardFooter>
