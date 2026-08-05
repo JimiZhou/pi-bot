@@ -2,7 +2,6 @@
 import { lazy } from "react"
 import {
   Activity,
-  AtSign,
   Bot,
   Boxes,
   Braces,
@@ -10,10 +9,8 @@ import {
   Cable,
   ClipboardCheck,
   Cloud,
-  ContactRound,
   FileClock,
   Globe2,
-  Images,
   MessageSquareText,
   Settings2,
   SmilePlus,
@@ -33,9 +30,6 @@ const PluginsConsole = lazy(() => import("@/features/admin/plugins-console"))
 const ChatroomsConsole = lazy(() => import("@/features/admin/chatrooms-console"))
 const EmojisConsole = lazy(() => import("@/features/admin/emojis-console"))
 const ParticipationConsole = lazy(() => import("@/features/admin/participation-console"))
-const IdentityConsole = lazy(() => import("@/features/wechat/identity-console"))
-const ContactsConsole = lazy(() => import("@/features/wechat/contacts-console"))
-const MomentsConsole = lazy(() => import("@/features/wechat/moments-console"))
 const ModelsConsole = lazy(() => import("@/features/admin/models-console"))
 const KnowledgeConsole = lazy(() => import("@/features/admin/knowledge-console"))
 const McpConsole = lazy(() => import("@/features/admin/mcp-console"))
@@ -153,36 +147,9 @@ const registeredConsoleModules: ConsoleModule[] = [
     id: "emojis",
     label: "表情包",
     description: "素材、描述与思考反馈",
-    group: "wechat",
+    group: "conversations",
     icon: SmilePlus,
     component: EmojisConsole,
-  },
-  {
-    id: "wechat-identity",
-    label: "微信身份",
-    description: "昵称、头像与二维码",
-    group: "wechat",
-    icon: AtSign,
-    component: IdentityConsole,
-    order: 20,
-  },
-  {
-    id: "contacts",
-    label: "联系人",
-    description: "搜索、备注与标签",
-    group: "wechat",
-    icon: ContactRound,
-    component: ContactsConsole,
-    order: 30,
-  },
-  {
-    id: "moments",
-    label: "朋友圈",
-    description: "发布、互动与自动策略",
-    group: "wechat",
-    icon: Images,
-    component: MomentsConsole,
-    order: 40,
   },
   {
     id: "settings",
@@ -213,11 +180,8 @@ const registeredConsoleModules: ConsoleModule[] = [
   },
 ]
 
-export const coreConsoleModules = registeredConsoleModules.filter((module) => module.group !== "wechat")
-export const wechatConsoleModules = registeredConsoleModules.filter((module) => module.group === "wechat")
+export const coreConsoleModules = registeredConsoleModules
 
 export function consoleModulesFor(manifest: ConsoleManifest): ConsoleModule[] {
-  return manifest.modules.includes("wechat")
-    ? [...coreConsoleModules, ...wechatConsoleModules]
-    : coreConsoleModules
+  return manifest.modules.includes("core") ? coreConsoleModules : []
 }

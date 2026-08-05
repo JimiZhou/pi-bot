@@ -1,6 +1,6 @@
 import { AdminStore } from "./admin-store.js";
 import { AgentSupervisor } from "./supervisor.js";
-import { WechatIpadLoginManager } from "./wechat-ipad-login.js";
+import { ChannelAdapterRegistry } from "../channel-adapter.js";
 export interface AdminServerOptions {
     store: AdminStore;
     supervisor: AgentSupervisor;
@@ -10,7 +10,7 @@ export interface AdminServerOptions {
     allowPublicClients?: boolean;
     maxBodyBytes?: number;
     webRoot?: string;
-    ipadLoginManager?: WechatIpadLoginManager;
+    adapterRegistry?: ChannelAdapterRegistry;
 }
 export declare class AdminServer {
     #private;

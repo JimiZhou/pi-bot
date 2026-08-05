@@ -139,7 +139,7 @@ export function OverviewPanel({ snapshot }: { snapshot: ConsoleSnapshot }) {
         <Card className="shadow-none">
           <CardHeader>
             <CardTitle>处理链路</CardTitle>
-            <CardDescription>平台无关 Core + 标准 WeChat Adapter</CardDescription>
+            <CardDescription>平台无关 Core + 外部 Adapter</CardDescription>
           </CardHeader>
           <CardContent>
             <div className="space-y-1">

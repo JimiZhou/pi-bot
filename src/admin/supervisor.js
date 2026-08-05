@@ -1,17 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import { relative, resolve, sep } from "node:path";
-import { WechatIpadApiClient, isWechatIpadSessionInvalidError, } from "../adapters/wechat-ipad.js";
-import { createWechatAdapterRegistry } from "../adapters/definitions.js";
+import { ChannelAdapterRegistry } from "../channel-adapter.js";
 import { AistudioClient, DEFAULT_EMBEDDING_MODEL, createAistudioMediaToolProvider } from "../aistudio.js";
 import { LocalAssetStore } from "../asset-store.js";
 import { enrichInboundVoiceTranscripts, MemoryVoiceTranscriptCache } from "../audio-transcription.js";
 import { ChannelRuntime, MEDIA_RESOLVE_CAPABILITY } from "../channel.js";
 import { CHANNEL_FEATURE_SEND_IMAGE, CHANNEL_FEATURE_SEND_VOICE } from "../channel-capabilities.js";
 import { createChatSessionDescriptor, GroupAgentCore } from "../core.js";
-import { collectInboundEmoji, createEmojiToolProvider, emojiAssetWithOwner, } from "../emoji-library.js";
-import { backfillEmojiNativeMetadata } from "../wechat-emoji-compat.js";
-import { attachWechatEmojiXml } from "../wechat-emoji.js";
-import { replaceWechatIds, safeGroupDisplayName } from "../display-name.js";
+import { collectInboundEmoji, createEmojiToolProvider, emojiAssetWithOwner, retryEmojiAnalysis, } from "../emoji-library.js";
+import { replaceTransportIds, safeGroupDisplayName } from "../display-name.js";
 import { FallbackImageUnderstandingProvider, PiImageUnderstandingProvider, } from "../image-understanding.js";
 import { HttpKnowledgeRetriever } from "../knowledge-retriever.js";
 import { DEFAULT_TTS_STYLE, DEFAULT_TTS_VOICE, matchingTtsVoicePreset, resolveTtsVoiceStyleQuery, } from "../voice-style.js";
@@ -26,14 +23,8 @@ import { SqliteStore } from "../sqlite-store.js";
 import { SharedConversationState } from "../shared-conversation-state.js";
 import { AdminStore } from "./admin-store.js";
 import { resolveCustomModel } from "./model-runtime.js";
-const CHANNEL_ADAPTERS = createWechatAdapterRegistry();
-const DEFAULT_GROUP_MEMBER_REFRESH_INTERVAL_MS = 12 * 60 * 60_000;
-const MIN_GROUP_MEMBER_REFRESH_INTERVAL_MS = 60 * 60_000;
-const GROUP_MEMBER_NATIVE_CHANGE_COOLDOWN_MS = 30 * 60_000;
-const GROUP_MEMBER_PERIODIC_REQUEST_BUDGET = 2;
-const GROUP_MEMBER_RISK_BACKOFF_MS = 6 * 60 * 60_000;
-const IPAD_SESSION_INVALID_MESSAGE = "iPad 协议报告账号可能已退出，请重新登录";
-const IPAD_SESSION_REVALIDATE_INTERVAL_MS = 5 * 60_000;
+const EMOJI_ANALYSIS_RETRY_INTERVAL_MS = 15 * 60_000;
+const EMOJI_ANALYSIS_RETRY_MIN_AGE_MS = 30 * 60_000;
 /** Reconciles durable bot definitions into independently restartable Core + ChannelRuntime instances. */
 export class AgentSupervisor {
     #store;
@@ -41,7 +32,6 @@ export class AgentSupervisor {
     #env;
     #healthIntervalMs;
     #socialIntervalMs;
-    #groupMemberRefreshIntervalMs;
     #startedAt = Date.now();
     #runtimes = new Map();
     #states = new Map();
@@ -52,29 +42,25 @@ export class AgentSupervisor {
     #groupTitleInflight = new Map();
     #roomBots = new Map();
     #fallbackNotificationAt = new Map();
-    #groupMemberSyncTimers = new Map();
-    #groupMemberRefreshBackoffUntil = new Map();
-    #groupMemberRefreshFailures = new Map();
-    #groupMemberLastSuccessfulRefreshAt = new Map();
-    #ipadSessionInvalid = new Map();
-    #nativePresenceEventAt = new Map();
-    #appliedWechatPersona = new Map();
-    #momentAutomationPolledAt = new Map();
+    #adapterRegistry;
     #voiceTranscriptCache = new MemoryVoiceTranscriptCache(1_000);
     #sharedConversationState;
     #healthTimer;
     #socialTimer;
-    #groupMemberRefreshTimer;
+    #emojiAnalysisRetryTimer;
+    #emojiAnalysisRetriers = new Map();
+    #emojiAssetRecoveryInflight = new Map();
+    #emojiAnalysisRetryRunning = false;
     #socialPollRunning = false;
     #closed = false;
     constructor(options) {
         this.#store = options.store;
         this.#dataDirectory = resolve(options.dataDirectory);
+        this.#adapterRegistry = options.adapterRegistry ?? new ChannelAdapterRegistry();
         this.#sharedConversationState = new SharedConversationState(safeDataPath(this.#dataDirectory, "fusion/shared-agent.sqlite"));
         this.#env = options.env ?? process.env;
         this.#healthIntervalMs = boundedInteger(options.healthIntervalMs ?? 30_000, 5000, 10 * 60_000);
         this.#socialIntervalMs = boundedInteger(options.socialIntervalMs ?? 60_000, 10_000, 10 * 60_000);
-        this.#groupMemberRefreshIntervalMs = boundedInteger(options.groupMemberRefreshIntervalMs ?? DEFAULT_GROUP_MEMBER_REFRESH_INTERVAL_MS, MIN_GROUP_MEMBER_REFRESH_INTERVAL_MS, 7 * 24 * 60 * 60_000);
     }
     async start() {
         this.#assertOpen();
@@ -90,11 +76,9 @@ export class AgentSupervisor {
         this.#healthTimer.unref();
         this.#socialTimer = setInterval(() => void this.#pollSocialSchedule(), this.#socialIntervalMs);
         this.#socialTimer.unref();
-        // Some protocol builds omit member-alias callbacks. Persisted snapshots are
-        // the startup source; a small, long-period budget is the fallback so a
-        // restart never bursts GetChatRoomMemberDetail across every known room.
-        this.#groupMemberRefreshTimer = setInterval(() => this.#schedulePeriodicGroupMemberRefresh(), this.#groupMemberRefreshIntervalMs);
-        this.#groupMemberRefreshTimer.unref();
+        this.#emojiAnalysisRetryTimer = setInterval(() => void this.#retryFailedEmojiAnalyses(), EMOJI_ANALYSIS_RETRY_INTERVAL_MS);
+        this.#emojiAnalysisRetryTimer.unref();
+        void this.#retryFailedEmojiAnalyses();
     }
     async close() {
         if (this.#closed)
@@ -104,14 +88,12 @@ export class AgentSupervisor {
             clearInterval(this.#healthTimer);
         if (this.#socialTimer)
             clearInterval(this.#socialTimer);
-        if (this.#groupMemberRefreshTimer)
-            clearInterval(this.#groupMemberRefreshTimer);
-        for (const timer of this.#groupMemberSyncTimers.values())
-            clearTimeout(timer);
-        this.#groupMemberSyncTimers.clear();
+        if (this.#emojiAnalysisRetryTimer)
+            clearInterval(this.#emojiAnalysisRetryTimer);
         this.#healthTimer = undefined;
         this.#socialTimer = undefined;
-        this.#groupMemberRefreshTimer = undefined;
+        this.#emojiAnalysisRetryTimer = undefined;
+        this.#emojiAnalysisRetriers.clear();
         await Promise.allSettled([...this.#runtimes.keys()].map((id) => this.#stopNow(id)));
         this.#sharedConversationState.close();
         this.#log("info", "system", "supervisor.stopped", "机器人 Supervisor 已停止");
@@ -166,11 +148,7 @@ export class AgentSupervisor {
         const emoji = this.#store.getEmoji(id);
         if (!emoji)
             throw new Error(`Emoji ${id} does not exist`);
-        const assets = this.#runtimes.get(emoji.botId)?.channel.assets ?? new LocalAssetStore({
-            directory: safeDataPath(this.#dataDirectory, `bots/${emoji.botId}/assets`),
-            maxAssetBytes: 512 * 1024 * 1024,
-        });
-        const resolved = await assets.resolve(emoji.asset);
+        const resolved = await this.#resolveEmojiAsset(emoji.asset, emoji.botId);
         const chunks = [];
         let size = 0;
         for await (const chunk of resolved.content) {
@@ -305,7 +283,7 @@ export class AgentSupervisor {
                 senderName: message.direction === "outbound"
                     ? primary?.displayName ?? message.senderName
                     : safeGroupDisplayName(message.senderName, message.senderId),
-                text: replaceWechatIds(message.text, members),
+                text: replaceTransportIds(message.text, members),
             })),
             hasMore: page.length > requestedLimit,
         };
@@ -317,7 +295,7 @@ export class AgentSupervisor {
             chatroomId: canonical,
             memories: this.#sharedConversationState.store.listConversationMemories(canonical, 500, true),
             members: this.#sharedConversationState.store.listMembers(canonical)
-                .filter((member) => !canonicalIdentityId(member.id).endsWith("@chatroom"))
+                .filter((member) => canonicalIdentityId(member.id) !== canonicalConversationId(chatroomId))
                 .map((member) => ({
                 ...member,
                 displayName: safeGroupDisplayName(member.displayName, member.id, member.isBot ? "机器人" : "群友"),
@@ -396,6 +374,42 @@ export class AgentSupervisor {
         this.#assertChatroomAccess(botId, canonical);
         this.#sharedConversationState.store.forgetConversationMemoryAsAdmin(memoryId, canonical, "管理员从群聊管理删除");
     }
+    async saveGeneratedEmoji(botId, input) {
+        const bot = this.#store.getBot(botId);
+        if (!bot)
+            throw new Error(`Bot ${botId} does not exist`);
+        if (!(input.data instanceof Uint8Array) || input.data.byteLength < 1)
+            throw new Error("Generated meme data is empty");
+        if (!input.mimeType.startsWith("image/"))
+            throw new Error("Generated meme must be an image");
+        const assets = new LocalAssetStore({
+            directory: safeDataPath(this.#dataDirectory, `bots/${bot.id}/assets`),
+            maxAssetBytes: 512 * 1024 * 1024,
+        });
+        const asset = await assets.put({
+            data: input.data,
+            mimeType: input.mimeType,
+            name: input.name?.trim() || "meme-generated",
+            metadata: { kind: input.mimeType === "image/gif" ? "emoji" : "meme-generator", collectedByBotId: bot.id },
+        });
+        if (!asset.sha256)
+            throw new Error("Generated meme asset has no content hash");
+        const saved = this.#store.saveCollectedEmoji({
+            botId: bot.id,
+            asset,
+            sha256: asset.sha256,
+            description: input.description,
+        });
+        const emoji = saved.emoji.status === "ready"
+            ? saved.emoji
+            : this.#store.completeEmojiAnalysis(saved.emoji.id, input.description ?? "Meme 生成表情");
+        this.#log("info", "emoji.meme_saved", "已将生成的 meme 保存到表情库", {
+            emojiId: emoji.id,
+            memeKey: input.memeKey,
+            created: saved.created,
+        }, bot.id);
+        return emoji;
+    }
     async sendChatroomMessage(botId, chatroomId, input) {
         const canonical = canonicalConversationId(chatroomId);
         this.#assertChatroomAccess(botId, canonical);
@@ -407,7 +421,7 @@ export class AgentSupervisor {
             throw new Error(`Bot ${config.id} is not running`);
         // Do not reject an operator send because one preflight health probe had a
         // transient false negative. The proactive path persists to the durable
-        // outbox first; a real protocol failure remains pending for normal retry.
+        // outbox first; a real channel failure remains pending for normal retry.
         const normalizedText = input.text?.normalize("NFKC").trim() ?? "";
         const emojiId = input.emojiId?.normalize("NFKC").trim() || undefined;
         if ((!normalizedText && !emojiId) || (normalizedText && emojiId)) {
@@ -454,78 +468,38 @@ export class AgentSupervisor {
     async checkGateway(id) {
         return (await this.#probeGateway(id, true)).health;
     }
-    wechatClient(botId) {
+    channelCapabilities(botId) {
         const bot = this.#store.getBot(botId);
         if (!bot)
             throw new Error(`Bot ${botId} does not exist`);
-        if (bot.channel.type !== "wechat-ipad")
-            throw new Error(`Bot ${botId} does not use the WeChat iPad channel`);
-        const client = this.#runtimes.get(botId)?.channel.wechat;
-        if (!client)
-            throw new Error(`Bot ${botId} must be running before WeChat management operations are available`);
-        return client;
-    }
-    wechatCapabilities(botId) {
-        const bot = this.#store.getBot(botId);
-        if (!bot)
-            throw new Error(`Bot ${botId} does not exist`);
+        const plugin = this.#runtimes.get(botId)?.channel.plugin;
         return {
             botId,
             channelType: bot.channel.type,
-            available: bot.channel.type === "wechat-ipad" && Boolean(this.#runtimes.get(botId)?.channel.wechat),
-            accountProfile: bot.channel.type === "wechat-ipad",
-            avatar: bot.channel.type === "wechat-ipad",
-            groupManagement: bot.channel.type === "wechat-ipad",
-            contacts: bot.channel.type === "wechat-ipad",
-            labels: bot.channel.type === "wechat-ipad",
-            moments: bot.channel.type === "wechat-ipad",
-            groupNicknameSync: false,
-            groupNicknameReason: "当前 874 HTTP 服务没有暴露 CmdID 48；不会用修改群名称接口冒充群内昵称。",
+            available: Boolean(plugin),
+            features: plugin?.features ?? [],
+            capabilities: plugin?.capabilities?.map((item) => item.capability) ?? [],
         };
     }
-    async applyPersonaIdentity(botId, personaProfileId, options = {}) {
+    async applyChannelIdentity(botId, personaProfileId, options = {}) {
         const persona = this.#store.getPersonaProfile(personaProfileId);
         if (!persona?.enabled)
             throw new Error(`Persona ${personaProfileId} is not available`);
-        const client = this.wechatClient(botId);
+        const channel = this.#runtimes.get(botId)?.channel;
+        const applyIdentity = channel?.plugin?.applyIdentity;
         const allowed = options.force === true || persona.autoApplyAccountProfile;
-        const signature = createHash("sha256").update(JSON.stringify({
-            accountNickname: persona.accountNickname ?? "",
-            avatarDataUrl: persona.avatarDataUrl ?? "",
-        })).digest("hex");
         const result = {
             botId,
             personaProfileId,
-            agentIdentityApplied: true,
+            agentIdentityApplied: Boolean(channel),
             accountProfileApplied: false,
             groupNicknameApplied: false,
-            groupNicknameAvailable: false,
             ...(options.conversationId ? { conversationId: canonicalConversationId(options.conversationId) } : {}),
         };
-        if (!allowed)
+        if (!allowed || typeof applyIdentity !== "function")
             return { ...result, skipped: "autoApplyAccountProfile is disabled" };
-        if (!options.force && this.#appliedWechatPersona.get(botId) === signature) {
-            return { ...result, skipped: "already applied" };
-        }
-        if (persona.accountNickname) {
-            await client.updateAccountProfile({ nickname: persona.accountNickname });
-            result.accountNicknameApplied = true;
-            result.accountProfileApplied = true;
-        }
-        if (persona.avatarDataUrl) {
-            await client.uploadHeadImage(imageDataUrlBytes(persona.avatarDataUrl));
-            result.avatarApplied = true;
-            result.accountProfileApplied = true;
-        }
-        this.#appliedWechatPersona.set(botId, signature);
-        this.#log("info", "channel", "wechat.persona_identity_applied", `已将人设 ${persona.label} 应用到微信账号`, {
-            personaProfileId,
-            accountNicknameApplied: result.accountNicknameApplied === true,
-            avatarApplied: result.avatarApplied === true,
-            groupNicknameAvailable: false,
-            ...(options.conversationId ? { conversationId: canonicalConversationId(options.conversationId) } : {}),
-        }, botId);
-        return result;
+        const applied = await applyIdentity({ persona, conversationId: options.conversationId });
+        return { ...result, ...applied, accountProfileApplied: true };
     }
     /** Copies one logical room's management state to every account known in that room. */
     synchronizeChatroomConfiguration(sourceBotId, chatroomId) {
@@ -601,7 +575,7 @@ export class AgentSupervisor {
         if (!managed.channel.testCallback)
             throw new Error("This channel does not provide a callback test event");
         const result = await managed.channel.testCallback();
-        this.#log("info", "channel", "webhook.test", "Webhook 测试事件已发送", undefined, id);
+        this.#log("info", "channel", "callback.test", "回调测试事件已发送", undefined, id);
         return result;
     }
     async ensureWebhook(id, webhookUrl) {
@@ -609,7 +583,7 @@ export class AgentSupervisor {
         if (!managed)
             throw new Error(`Bot ${id} is not running`);
         const registration = await managed.channel.registerCallback(webhookUrl);
-        this.#log("info", "channel", "webhook.registered", "回调已注册到微信网关", { registrationId: registration.id, url: registration.url, created: registration.created }, id);
+        this.#log("info", "channel", "callback.registered", "回调已注册到通道", { registrationId: registration.id, url: registration.url, created: registration.created }, id);
         return registration;
     }
     #serialize(id, operation) {
@@ -761,29 +735,59 @@ export class AgentSupervisor {
             const fastChat = config.fastChatModelProfileId
                 ? runnerFor(config.fastChatModelProfileId)
                 : undefined;
-            const participationJudgeRuntime = config.participationJudgeModelProfileId
-                ? this.#resolvedModel(config.participationJudgeModelProfileId, "participation judge", false)
+            // The participation judge must never route to the disabled local
+            // Qwen profile. Prefer an explicitly configured Gemini profile, then
+            // the fast/default chat profile, and finally any enabled Gemini.
+            const geminiJudgeProfiles = this.#store.listModelProfiles().filter((candidate) => {
+                const provider = this.#store.getProviderProfile(candidate.providerProfileId);
+                return isGeminiChatProfile(candidate, provider);
+            });
+            const participationJudgeProfileId = selectGeminiParticipationProfileId([
+                config.participationJudgeModelProfileId,
+                config.fastChatModelProfileId,
+                chatProfileId,
+            ], geminiJudgeProfiles);
+            const participationJudgePrimary = participationJudgeProfileId
+                ? this.#requiredProfile(participationJudgeProfileId, "Gemini participation judge")
                 : undefined;
-            // Keep participation judging isolated from the final reply chain. In
-            // particular, do not use runnerFor() here: it appends Gemini/CPA reply
-            // fallbacks, while a failed local judge must simply fail closed.
-            const participationJudgeRunner = participationJudgeRuntime
-                ? new PiAgentRunner({
-                    model: participationJudgeRuntime.model,
-                    apiKey: participationJudgeRuntime.apiKey,
-                    thinkingLevel: participationJudgeRuntime.profile.thinkingLevel,
-                    maxOutputTokens: Math.min(participationJudgeRuntime.profile.maxTokens, 64),
-                    maxRetryDelayMs: Math.min(participationJudgeRuntime.profile.maxRetryDelayMs, 1_000),
+            const judgeProfiles = participationJudgePrimary
+                ? geminiJudgeProfiles.filter((candidate) => candidate.providerProfileId === participationJudgePrimary.providerProfileId)
+                : [];
+            const participationJudgeProfileIds = participationJudgePrimary
+                ? [...new Set([
+                    participationJudgePrimary.id,
+                    ...orderedGeminiFallbackProfileIds(participationJudgePrimary, judgeProfiles),
+                    ...geminiJudgeProfiles.filter((candidate) => candidate.id !== participationJudgePrimary.id).map((candidate) => candidate.id),
+                ])]
+                : [];
+            const participationJudgeChain = participationJudgeProfileIds.map((id) => this.#resolvedModel(id, "Gemini participation judge", false));
+            // Keep participation judging isolated from the final reply chain. It
+            // stays entirely inside Gemini, with no local or external fallback.
+            let participationJudgeRunner;
+            for (let index = participationJudgeChain.length - 1; index >= 0; index -= 1) {
+                const resolved = participationJudgeChain[index];
+                const fallback = participationJudgeRunner;
+                participationJudgeRunner = new PiAgentRunner({
+                    model: resolved.model,
+                    apiKey: resolved.apiKey,
+                    thinkingLevel: "off",
+                    maxOutputTokens: Math.min(resolved.profile.maxTokens, 128),
+                    maxRetryDelayMs: Math.min(resolved.profile.maxRetryDelayMs, 1_000),
                     retryDelaysMs: [],
                     attemptTimeoutMs: Math.min(config.limits.agentTimeoutMs, 20_000),
-                })
-                : fastChat?.runner;
+                    ...(fallback ? {
+                        fallbackRunner: fallback,
+                        fallbackMode: "internal",
+                        circuitBreakerCooldownMs: 60_000,
+                    } : {}),
+                });
+            }
             const fallbackChats = fallbackChatProfileIds.map((id) => this.#resolvedModel(id, "chat fallback", false));
             const aistudioClient = defaultChat.runtime.providerProfile.provider === "aistudio"
                 ? new AistudioClient({
                     baseUrl: defaultChat.runtime.providerProfile.baseUrl,
                     apiKey: defaultChat.runtime.apiKey,
-                    timeoutMs: Math.max(120_000, config.channel.type === "wechat-ipad" ? config.channel.apiTimeoutMs : config.channel.gatewayTimeoutMs),
+                    timeoutMs: Math.max(120_000, channelTimeoutMs(config.channel)),
                 })
                 : undefined;
             // TTS availability and circuit state remain independent from text and
@@ -956,7 +960,19 @@ export class AgentSupervisor {
                 visionCache.set(profileId, value);
                 return value;
             };
-            const defaultVisionProfileId = config.visionModelProfileId ?? settings.defaultVisionModelProfileId;
+            // A vision profile is optional in the admin UI, but image messages
+            // must still be actionable. When no explicit vision profile exists,
+            // select an enabled Gemini profile that advertises image input so
+            // the main model never has to answer from an image placeholder.
+            const configuredVisionProfileId = config.visionModelProfileId ?? settings.defaultVisionModelProfileId;
+            const geminiVisionProfiles = this.#store.listModelProfiles().filter((candidate) => {
+                const provider = this.#store.getProviderProfile(candidate.providerProfileId);
+                return isGeminiVisionProfile(candidate, provider);
+            });
+            const defaultVisionProfileId = configuredVisionProfileId ?? selectGeminiVisionProfileId([
+                chatProfileId,
+                config.fastChatModelProfileId,
+            ], geminiVisionProfiles);
             const defaultVision = config.imageUnderstandingEnabled && defaultVisionProfileId
                 ? visionFor(defaultVisionProfileId)
                 : undefined;
@@ -1108,10 +1124,6 @@ export class AgentSupervisor {
                 onTrace: (event) => this.#trace(config.id, event),
             });
             core.pruneParticipationCases(settings.participationRetentionDays, settings.maxParticipationCasesPerBot);
-            const emojiMetadataBackfilled = backfillEmojiNativeMetadata(this.#store, config.id, (eventId) => core.inboundImages(eventId));
-            if (emojiMetadataBackfilled > 0) {
-                this.#log("info", "agent", "emoji.native_metadata_backfilled", "已恢复历史表情包的原生 GIF 发送元数据", { count: emojiMetadataBackfilled }, config.id);
-            }
             runtime = new ChannelRuntime({
                 core,
                 plugin: channel.plugin,
@@ -1136,7 +1148,7 @@ export class AgentSupervisor {
                     ])];
                 runtime.setInboundTransformers([
                     async (event) => {
-                        if (!channel.assets || event.metadata?.nativeType !== "47")
+                        if (!channel.assets || !hasEmojiImage(event))
                             return event;
                         const visionProvider = config.imageUnderstandingEnabled
                             ? chatroomValue(chatroomVisionProviders, event) ?? defaultVision?.provider
@@ -1152,7 +1164,6 @@ export class AgentSupervisor {
                                 visionProvider,
                                 maxImageBytes: config.limits.maxImageBytes,
                                 timeoutMs: config.limits.imageUnderstandingTimeoutMs,
-                                normalizeAsset: attachWechatEmojiXml,
                                 log: (level, name, message, details) => this.#log(level, "agent", name, message, details, config.id),
                             });
                             if (!emoji?.description.trim())
@@ -1218,7 +1229,7 @@ export class AgentSupervisor {
                                 },
                                 cache: this.#voiceTranscriptCache,
                             });
-                            this.#log("info", "agent", "voice.transcribed", "入站微信语音已转写", {
+                            this.#log("info", "agent", "voice.transcribed", "入站语音已转写", {
                                 eventId: event.id,
                                 conversationId: event.conversation.id,
                                 transcribed: enriched.transcribed,
@@ -1240,20 +1251,14 @@ export class AgentSupervisor {
                     },
                 ]);
             }
-            const plugins = this.#createAgentPlugins(config, core, runtime);
+            const plugins = this.#createAgentPlugins(config, core, runtime, channel.assets);
             runtime.setInboundHandlers([
                 (event) => {
                     this.#observeLiveGroupRoom(config.id, event);
-                    this.#recordNativeGroupPresenceEvent(event);
                     return undefined;
                 },
                 async (event) => {
-                    if (config.channel.type !== "wx-hook-http")
-                        return undefined;
-                    return this.#forwardGroupEventToIpad(config, event);
-                },
-                async (event) => {
-                    if (!channel.assets || event.metadata?.nativeType !== "47")
+                    if (!channel.assets || !hasEmojiImage(event))
                         return undefined;
                     const visionProvider = config.imageUnderstandingEnabled
                         ? chatroomValue(chatroomVisionProviders, event) ?? defaultVision?.provider
@@ -1268,7 +1273,6 @@ export class AgentSupervisor {
                         ...(visionProvider ? { visionProvider } : {}),
                         maxImageBytes: config.limits.maxImageBytes,
                         timeoutMs: config.limits.imageUnderstandingTimeoutMs,
-                        normalizeAsset: attachWechatEmojiXml,
                         log: (level, name, message, details) => this.#log(level, "agent", name, message, details, config.id),
                     }).catch((error) => {
                         this.#log("warn", "agent", "emoji.collect_failed", errorMessage(error), { eventId: event.id }, config.id);
@@ -1283,6 +1287,16 @@ export class AgentSupervisor {
             for (const plugin of plugins)
                 await plugin.start?.();
             this.#runtimes.set(config.id, { core, runtime, channel, plugins });
+            if (defaultVision && channel.assets) {
+                this.#emojiAnalysisRetriers.set(config.id, (emoji) => retryEmojiAnalysis(emoji, {
+                    store: this.#store,
+                    assets: { resolve: (asset) => this.#resolveEmojiAsset(asset, emoji.botId) },
+                    visionProvider: defaultVision.provider,
+                    maxImageBytes: config.limits.maxImageBytes,
+                    timeoutMs: config.limits.imageUnderstandingTimeoutMs,
+                    log: (level, name, message, details) => this.#log(level, "agent", name, message, details, config.id),
+                }));
+            }
             state.phase = "running";
             state.since = Date.now();
             state.startedAt = Date.now();
@@ -1312,7 +1326,7 @@ export class AgentSupervisor {
             this.#log("error", "bot", "bot.start_failed", state.lastError, undefined, config.id);
         }
     }
-    #createAgentPlugins(config, core, runtime) {
+    #createAgentPlugins(config, core, runtime, assets) {
         const registry = createBuiltInAgentPluginRegistry();
         const personaCommand = { id: "persona-command", type: "persona-command", enabled: true, settings: {} };
         const builtIns = withImplicitBuiltInPlugins(config.plugins);
@@ -1329,6 +1343,7 @@ export class AgentSupervisor {
             timezoneOffsetMinutes: config.socialSchedule.timezoneOffsetMinutes,
             core,
             runtime,
+            ...(assets ? { assets } : {}),
             scheduledTasks: this.#store,
             personas: {
                 list: () => this.#store.listPersonaProfiles(),
@@ -1356,7 +1371,7 @@ export class AgentSupervisor {
                 },
                 resetContext: (conversationId, actorId, sourceEventId) => core.resetConversationContext(conversationId, actorId, sourceEventId),
                 contextReset: (conversationId) => core.conversationContextReset(conversationId),
-                sessionStatuses: (conversationId) => canonicalConversationId(conversationId).endsWith("@chatroom")
+                sessionStatuses: (conversationId) => this.#roomsForBot(config.id).has(canonicalConversationId(conversationId))
                     ? this.listChatroomSessions(config.id, conversationId)
                     : [this.#directConversationSession(config, conversationId, core.conversationContextReset(conversationId))],
                 listPlugins: (conversationId) => this.#conversationPlugins(config.id, conversationId),
@@ -1467,7 +1482,7 @@ export class AgentSupervisor {
     }
     #fusionPeerBots(botId, conversationId) {
         const roomId = canonicalConversationId(conversationId);
-        if (!this.#store.getBot(botId) || !roomId.endsWith("@chatroom"))
+        if (!this.#store.getBot(botId) || !roomId)
             return [];
         this.#rememberBotRoom(botId, roomId);
         return this.#fusionBotsForRoom(roomId).filter((bot) => bot.id !== botId && bot.enabled);
@@ -1561,9 +1576,8 @@ export class AgentSupervisor {
     #conversationPersona(botId, conversationId) {
         const bot = this.#store.getBot(botId);
         const chatroomId = canonicalConversationId(conversationId);
-        const override = chatroomId.endsWith("@chatroom")
-            ? bot?.chatroomModelOverrides.find((item) => canonicalConversationId(item.chatroomId) === chatroomId)?.personaProfileId
-            : this.#store.getConversationPersonaOverride(botId, conversationId);
+        const override = bot?.chatroomModelOverrides.find((item) => canonicalConversationId(item.chatroomId) === chatroomId)?.personaProfileId
+            ?? this.#store.getConversationPersonaOverride(botId, conversationId);
         const profileId = override ?? bot?.personaProfileId ?? this.#store.getGlobalSettings().defaultPersonaProfileId;
         if (!profileId)
             return undefined;
@@ -1575,9 +1589,7 @@ export class AgentSupervisor {
         if (!bot)
             throw new Error(`Bot ${botId} does not exist`);
         const roomId = canonicalConversationId(conversationId);
-        const override = roomId.endsWith("@chatroom")
-            ? bot.chatroomModelOverrides.find((item) => canonicalConversationId(item.chatroomId) === roomId)
-            : undefined;
+        const override = bot.chatroomModelOverrides.find((item) => canonicalConversationId(item.chatroomId) === roomId);
         const voice = override?.ttsVoice ?? DEFAULT_TTS_VOICE;
         const style = override?.ttsStyle ?? DEFAULT_TTS_STYLE;
         const preset = matchingTtsVoicePreset(voice, style);
@@ -1594,8 +1606,6 @@ export class AgentSupervisor {
         if (!bot)
             throw new Error(`Bot ${botId} does not exist`);
         const roomId = canonicalConversationId(conversationId);
-        if (!roomId.endsWith("@chatroom"))
-            throw new Error("Voice style overrides only support group chats");
         const existing = bot.chatroomModelOverrides.find((item) => canonicalConversationId(item.chatroomId) === roomId);
         const updated = existing
             ? cloneChatroomOverride(existing, roomId)
@@ -1633,10 +1643,10 @@ export class AgentSupervisor {
         const profile = personaProfileId ? this.#store.getPersonaProfile(personaProfileId) : undefined;
         if (personaProfileId && (!profile || !profile.enabled))
             throw new Error(`Persona ${personaProfileId} is not available`);
-        if (!chatroomId.endsWith("@chatroom")) {
+        if (!bot.chatroomModelOverrides.some((item) => canonicalConversationId(item.chatroomId) === chatroomId)) {
             this.#store.setConversationPersonaOverride(botId, conversationId, personaProfileId);
             if (profile?.autoApplyAccountProfile) {
-                void this.applyPersonaIdentity(botId, profile.id, { conversationId }).catch((error) => this.#log("warn", "channel", "wechat.persona_identity_apply_failed", errorMessage(error), {
+                void this.applyChannelIdentity(botId, profile.id, { conversationId }).catch((error) => this.#log("warn", "channel", "channel.persona_identity_apply_failed", errorMessage(error), {
                     personaProfileId: profile.id,
                     conversationId,
                 }, botId));
@@ -1666,7 +1676,7 @@ export class AgentSupervisor {
         });
         this.synchronizeChatroomConfiguration(botId, chatroomId);
         if (profile?.autoApplyAccountProfile) {
-            void this.applyPersonaIdentity(botId, profile.id, { conversationId: chatroomId }).catch((error) => this.#log("warn", "channel", "wechat.persona_identity_apply_failed", errorMessage(error), {
+            void this.applyChannelIdentity(botId, profile.id, { conversationId: chatroomId }).catch((error) => this.#log("warn", "channel", "channel.persona_identity_apply_failed", errorMessage(error), {
                 personaProfileId: profile.id,
                 conversationId: chatroomId,
             }, botId));
@@ -1674,9 +1684,6 @@ export class AgentSupervisor {
         return profile;
     }
     async #createManagedChannel(config, stateDirectory) {
-        const isPeerBotSender = (nativeSenderId) => this.#store
-            .listBots()
-            .some((candidate) => candidate.id !== config.id && candidate.identityId === nativeSenderId);
         const outboundAssetStores = new Map();
         const outboundAssetStore = (asset) => {
             const collectedByBotId = typeof asset.metadata?.collectedByBotId === "string"
@@ -1695,93 +1702,19 @@ export class AgentSupervisor {
         };
         const assets = outboundAssetStore({ metadata: { collectedByBotId: config.id } });
         const outboundMediaResolver = {
-            resolve: (asset) => outboundAssetStore(asset).resolve(asset),
+            resolve: (asset) => this.#resolveEmojiAsset(asset, typeof asset.metadata?.collectedByBotId === "string"
+                ? asset.metadata.collectedByBotId
+                : config.id),
         };
-        if (config.channel.type === "wechat-ipad") {
-            const channelConfig = config.channel;
-            const apiToken = channelConfig.apiTokenEnv
-                ? requiredSecret(this.#env, channelConfig.apiTokenEnv)
-                : undefined;
-            const onSessionInvalid = (error) => this.#handleIpadSessionInvalid(config.id, error);
-            const plugin = await CHANNEL_ADAPTERS.create("wechat-ipad", {
-                pluginId: `wechat-ipad-${config.id}`,
-                displayName: `${config.displayName} WeChat iPad`,
-                api: {
-                    baseUrl: channelConfig.apiBaseUrl,
-                    accountWxid: channelConfig.accountWxid,
-                    ...(apiToken ? { apiToken } : {}),
-                    timeoutMs: channelConfig.apiTimeoutMs,
-                    onSessionInvalid,
-                },
-                callback: {
-                    host: channelConfig.callbackHost,
-                    port: channelConfig.callbackPort,
-                    pathPrefix: channelConfig.callbackPathPrefix,
-                    allowedSourceIps: channelConfig.callbackAllowedSourceIps,
-                    maxBodyBytes: channelConfig.callbackMaxBodyBytes,
-                    routerBaseUrl: channelConfig.callbackRouterBaseUrl,
-                    advertiseHost: channelConfig.callbackAdvertiseHost,
-                    autoRegister: channelConfig.autoRegisterCallback,
-                    registerIntervalMs: channelConfig.registerIntervalMs,
-                },
-                stateDirectory,
-                ...(channelConfig.accountId ? { accountId: channelConfig.accountId } : {}),
-                ingestRetryMs: channelConfig.ingestRetryMs,
-                isBotSender: isPeerBotSender,
-                resolveGroupMemberName: (roomId, senderId) => this.#resolveGroupMemberName(roomId, senderId),
-                onGroupContactChanged: (roomId, kind) => this.#handleGroupContactChange(config.id, roomId, kind),
-                onSessionActivity: (observedAt) => this.#handleIpadSessionActivity(config.id, observedAt),
-                outboundMediaResolver,
-                onError: (error, context) => {
-                    this.#log("error", "channel", `channel.${context.phase}`, errorMessage(error), { ...context }, config.id);
-                },
-            });
-            const metadataClient = new WechatIpadApiClient({
-                baseUrl: channelConfig.apiBaseUrl,
-                accountWxid: channelConfig.accountWxid,
-                ...(apiToken ? { apiToken } : {}),
-                timeoutMs: Math.min(channelConfig.apiTimeoutMs, 8000),
-                onSessionInvalid,
-            });
-            return {
-                plugin,
-                assets,
-                wechat: metadataClient,
-                health: () => plugin.client.health(),
-                resolveConversationTitle: async (chatroomId) => (await metadataClient.getGroupInfo(chatroomId)).title,
-                listGroupMembers: (chatroomId) => metadataClient.listGroupMembers(chatroomId),
-                callbackAddress: () => plugin.callbackAddress(),
-                registerCallback: async () => {
-                    const registration = await plugin.registerCallback();
-                    return { id: registration.accountWxid, created: true, url: registration.clientHost };
-                },
-            };
-        }
-        const channelConfig = config.channel;
-        const channelToken = requiredSecret(this.#env, channelConfig.apiTokenEnv);
-        const webhookSecret = requiredSecret(this.#env, channelConfig.webhookSecretEnv);
-        const plugin = await CHANNEL_ADAPTERS.create("wx-hook-http", {
-            pluginId: `wx-hook-${config.id}`,
-            displayName: `${config.displayName} wx_hook_bridge`,
-            gateway: {
-                baseUrl: channelConfig.gatewayBaseUrl,
-                apiToken: channelToken,
-                timeoutMs: channelConfig.gatewayTimeoutMs,
-            },
-            webhook: {
-                host: channelConfig.webhookHost,
-                port: channelConfig.webhookPort,
-                path: channelConfig.webhookPath,
-                secret: webhookSecret,
-            },
+        const plugin = await this.#adapterRegistry.create(config.channel.type, {
+            pluginId: `channel-${config.id}`,
+            displayName: config.displayName,
+            config: config.channel,
+            settings: config.channel.settings,
             stateDirectory,
-            ...(channelConfig.accountId ? { accountId: channelConfig.accountId } : {}),
-            acceptUnknownGroupSenders: channelConfig.acceptUnknownGroupSenders,
-            nativeQuoteReplies: channelConfig.nativeQuoteReplies,
-            ingestRetryMs: channelConfig.ingestRetryMs,
-            isBotSender: isPeerBotSender,
-            resolveGroupMemberName: (roomId, senderId) => this.#resolveGroupMemberName(roomId, senderId),
+            assets,
             outboundMediaResolver,
+            resolveGroupMemberName: (roomId, senderId) => this.#resolveGroupMemberName(roomId, senderId),
             onError: (error, context) => {
                 this.#log("error", "channel", `channel.${context.phase}`, errorMessage(error), { ...context }, config.id);
             },
@@ -1789,43 +1722,20 @@ export class AgentSupervisor {
         return {
             plugin,
             assets,
-            health: () => plugin.gateway.health(),
-            resolveConversationTitle: async (chatroomId) => (await plugin.gateway.listContacts()).find((item) => canonicalConversationId(item.id) === chatroomId)?.displayName,
-            callbackAddress: () => plugin.webhookAddress(),
-            registerCallback: async (webhookUrl) => {
-                const normalized = validatedWebhookUrl(webhookUrl, channelConfig.webhookPath);
-                const existing = (await plugin.gateway.listWebhooks()).find((item) => item.url === normalized);
-                if (existing)
-                    return { id: existing.id, created: false, url: existing.url };
-                const registration = await plugin.gateway.registerWebhook({
-                    url: normalized,
-                    events: ["message.received"],
-                    secret: webhookSecret,
-                    enabled: true,
-                });
-                return { id: registration.id, created: true, url: registration.url };
-            },
-            testCallback: async () => {
-                const address = plugin.webhookAddress();
-                if (!address)
-                    throw new Error("Webhook listener is not ready");
-                const registrations = await plugin.gateway.listWebhooks();
-                const match = registrations.find((item) => {
-                    try {
-                        const url = new URL(item.url);
-                        return url.port === String(address.port) && url.pathname === address.path;
-                    }
-                    catch {
-                        return false;
-                    }
-                });
-                if (!match)
-                    throw new Error("Gateway has no webhook registration matching this bot's port and path");
-                return { deliveryId: await plugin.gateway.testWebhook(match.id) };
-            },
+            health: typeof plugin.health === "function" ? () => plugin.health() : async () => ({ ok: true }),
+            resolveConversationTitle: typeof plugin.resolveConversationTitle === "function"
+                ? (chatroomId) => plugin.resolveConversationTitle(chatroomId)
+                : undefined,
+            callbackAddress: typeof plugin.callbackAddress === "function" ? () => plugin.callbackAddress() : undefined,
+            registerCallback: typeof plugin.registerCallback === "function"
+                ? (webhookUrl) => plugin.registerCallback(webhookUrl)
+                : undefined,
+            testCallback: typeof plugin.testCallback === "function" ? () => plugin.testCallback() : undefined,
         };
     }
+
     async #stopNow(id) {
+        this.#emojiAnalysisRetriers.delete(id);
         const managed = this.#runtimes.get(id);
         if (!managed)
             return;
@@ -1855,15 +1765,66 @@ export class AgentSupervisor {
         }
         this.#log("info", "bot", "bot.stopped", "机器人已停止", undefined, id);
     }
+    async #retryFailedEmojiAnalyses() {
+        if (this.#emojiAnalysisRetryRunning || this.#closed)
+            return;
+        this.#emojiAnalysisRetryRunning = true;
+        try {
+            const cutoff = Date.now() - EMOJI_ANALYSIS_RETRY_MIN_AGE_MS;
+            for (const [botId, retry] of this.#emojiAnalysisRetriers) {
+                const candidate = this.#store.listEmojis(botId)
+                    .filter((emoji) => emoji.status === "failed" && emoji.updatedAt <= cutoff)
+                    .sort((left, right) => left.updatedAt - right.updatedAt)[0];
+                if (candidate) {
+                    try {
+                        await retry(candidate);
+                    }
+                    catch (error) {
+                        this.#log("warn", "agent", "emoji.analysis_retry_failed", errorMessage(error), { emojiId: candidate.id }, botId);
+                    }
+                }
+            }
+        }
+        finally {
+            this.#emojiAnalysisRetryRunning = false;
+        }
+    }
+    async #resolveEmojiAsset(asset, preferredBotId) {
+        const botIds = [...new Set([
+                preferredBotId,
+                typeof asset.metadata?.collectedByBotId === "string" ? asset.metadata.collectedByBotId : "",
+                ...this.#store.listBots().map((bot) => bot.id),
+            ].filter(Boolean))];
+        for (const botId of botIds) {
+            const store = new LocalAssetStore({
+                directory: safeDataPath(this.#dataDirectory, `bots/${botId}/assets`),
+                maxAssetBytes: 512 * 1024 * 1024,
+            });
+            if (await store.has(asset))
+                return store.resolve(asset);
+        }
+        const key = asset.sha256 ?? asset.id;
+        let inflight = this.#emojiAssetRecoveryInflight.get(key);
+        if (!inflight) {
+            inflight = this.#recoverEmojiAsset(asset, preferredBotId);
+            this.#emojiAssetRecoveryInflight.set(key, inflight);
+            void inflight.then(() => this.#emojiAssetRecoveryInflight.delete(key), () => this.#emojiAssetRecoveryInflight.delete(key));
+        }
+        return inflight;
+    }
+    async #recoverEmojiAsset(asset, preferredBotId) {
+        void preferredBotId;
+        throw new Error(`Local asset not found for emoji ${asset.id}; the adapter must keep media resolvable until delivery`);
+    }
     async #resolveGroupMemberName(roomId, senderId) {
-        if (!roomId.endsWith("@chatroom") || !senderId.trim())
+        if (!roomId || !senderId.trim())
             return undefined;
         const canonicalRoom = canonicalConversationId(roomId);
         const canonicalSender = canonicalIdentityId(senderId);
         const now = Date.now();
         const cached = this.#groupMemberCache.get(canonicalRoom);
         if (cached && cached.expiresAt > now) {
-            return cached.members.get(canonicalSender) ?? canonicalSender;
+            return cached.members.get(canonicalSender);
         }
         let inflight = this.#groupMemberInflight.get(canonicalRoom);
         if (!inflight) {
@@ -1872,40 +1833,7 @@ export class AgentSupervisor {
             void inflight.finally(() => this.#groupMemberInflight.delete(canonicalRoom));
         }
         const members = await inflight.catch(() => new Map());
-        return members.get(canonicalSender) ?? canonicalSender;
-    }
-    #scheduleGroupMemberSync(sourceBotId, conversationId, delayMs = 5000) {
-        const roomId = canonicalConversationId(conversationId);
-        if (!roomId.endsWith("@chatroom") || this.#closed)
-            return;
-        this.#rememberBotRoom(sourceBotId, roomId);
-        this.#groupMemberCache.delete(roomId);
-        const now = Date.now();
-        const dueAt = Math.max(now + boundedInteger(delayMs, 1000, this.#groupMemberRefreshIntervalMs), this.#groupMemberRefreshBackoffUntil.get(roomId) ?? 0, (this.#groupMemberLastSuccessfulRefreshAt.get(roomId) ?? 0) + GROUP_MEMBER_NATIVE_CHANGE_COOLDOWN_MS);
-        const active = this.#groupMemberSyncTimers.get(roomId);
-        if (active)
-            clearTimeout(active);
-        const timer = setTimeout(() => {
-            this.#groupMemberSyncTimers.delete(roomId);
-            void this.#syncGroupMemberChanges(roomId, sourceBotId).catch((error) => {
-                const backoffUntil = this.#noteGroupMemberRefreshFailure(roomId, error);
-                this.#log("error", "channel", "group.members_sync_failed", errorMessage(error), {
-                    conversationId: roomId,
-                    retryAfterMs: Math.max(0, backoffUntil - Date.now()),
-                }, sourceBotId);
-            });
-        }, Math.max(1000, dueAt - now));
-        timer.unref();
-        this.#groupMemberSyncTimers.set(roomId, timer);
-    }
-    #handleGroupContactChange(botId, conversationId, kind) {
-        const roomId = canonicalConversationId(conversationId);
-        if (kind === "deleted") {
-            this.#deactivateGroupRoom(botId, roomId, "protocol-del-contact", true);
-            return;
-        }
-        this.#activateGroupRoom(botId, roomId);
-        this.#scheduleGroupMemberSync(botId, roomId);
+        return members.get(canonicalSender);
     }
     #observeLiveGroupRoom(botId, event) {
         if (event.conversation.kind !== "group")
@@ -1913,21 +1841,30 @@ export class AgentSupervisor {
         const roomId = canonicalConversationId(event.conversation.id);
         const kind = event.metadata?.systemEventKind;
         if (kind === "bot-removed-from-group" || kind === "group-dissolved") {
-            this.#deactivateGroupRoom(botId, roomId, `native-${kind}`, true);
+            this.#deactivateGroupRoom(botId, roomId, `standard-${kind}`, true);
             return;
         }
         this.#activateGroupRoom(botId, roomId);
+        for (const member of event.metadata?.members ?? []) {
+            if (!member || typeof member !== "object")
+                continue;
+            const id = typeof member.id === "string" ? canonicalIdentityId(member.id) : "";
+            const displayName = typeof member.displayName === "string" ? safeGroupDisplayName(member.displayName, id) : "";
+            if (id && displayName) {
+                this.#sharedConversationState.store.upsertMember(roomId, {
+                    id,
+                    displayName,
+                    isBot: Boolean(member.isBot),
+                });
+            }
+        }
     }
     #activateGroupRoom(botId, conversationId) {
         const roomId = canonicalConversationId(conversationId);
         const reactivated = this.#store.markGroupRoomAvailable(botId, roomId);
         this.#rememberBotRoom(botId, roomId);
         if (reactivated) {
-            this.#groupMemberRefreshBackoffUntil.delete(roomId);
-            this.#groupMemberRefreshFailures.delete(roomId);
-            this.#log("info", "channel", "group.room_reactivated", "收到新的群事件，已恢复群监控", {
-                conversationId: roomId,
-            }, botId);
+            this.#log("info", "channel", "group.room_reactivated", "收到新的群事件，已恢复群监控", { conversationId: roomId }, botId);
         }
     }
     #deactivateGroupRoom(botId, conversationId, reason, confirmed) {
@@ -1936,224 +1873,23 @@ export class AgentSupervisor {
         if (!result.inactive)
             return result;
         this.#forgetBotRoom(botId, roomId);
-        const timer = this.#groupMemberSyncTimers.get(roomId);
-        if (timer)
-            clearTimeout(timer);
-        this.#groupMemberSyncTimers.delete(roomId);
-        this.#groupMemberRefreshBackoffUntil.delete(roomId);
-        this.#groupMemberRefreshFailures.delete(roomId);
-        this.#groupMemberLastSuccessfulRefreshAt.delete(roomId);
         const bot = this.#store.getBot(botId);
         if (bot) {
             const overrides = bot.chatroomModelOverrides.filter((item) => canonicalConversationId(item.chatroomId) !== roomId);
-            if (overrides.length !== bot.chatroomModelOverrides.length) {
+            if (overrides.length !== bot.chatroomModelOverrides.length)
                 this.#store.saveBot({ ...bot, chatroomModelOverrides: overrides });
-            }
         }
-        const hasActiveIpad = this.#store.listBots().some((candidate) => candidate.enabled && candidate.channel.type === "wechat-ipad" &&
-            !this.#store.isGroupRoomInactive(candidate.id, roomId) && this.#roomsForBot(candidate.id).has(roomId));
-        const deletedSnapshots = hasActiveIpad ? 0 : this.#store.deleteGroupMemberSnapshots(roomId);
+        this.#store.deleteGroupMemberSnapshots(roomId);
         this.#groupMemberCache.delete(roomId);
-        this.#log("info", "channel", "group.room_removed", "已自动移除退出或不可访问的群记录", {
+        this.#log("info", "channel", "group.room_removed", "适配器报告机器人已离开群聊，已移除群配置但保留历史", {
             conversationId: roomId,
             reason,
-            consecutiveUnavailable: result.consecutive,
-            deletedSnapshots,
             historyPreserved: true,
         }, botId);
         return result;
     }
-    #schedulePeriodicGroupMemberRefresh() {
-        if (this.#closed)
-            return;
-        const scheduled = new Set();
-        const now = Date.now();
-        for (const bot of this.#store.listBots()) {
-            if (!bot.enabled || bot.channel.type !== "wechat-ipad" || !this.#runtimes.get(bot.id)?.runtime.running)
-                continue;
-            for (const roomId of [...this.#roomsForBot(bot.id)].sort()) {
-                const canonical = canonicalConversationId(roomId);
-                if (!canonical.endsWith("@chatroom") || scheduled.has(canonical))
-                    continue;
-                if (this.#groupMemberSyncTimers.has(canonical))
-                    continue;
-                if ((this.#groupMemberRefreshBackoffUntil.get(canonical) ?? 0) > now)
-                    continue;
-                const lastSuccess = this.#groupMemberLastSuccessfulRefreshAt.get(canonical) ?? 0;
-                if (lastSuccess > 0 && now - lastSuccess < this.#groupMemberRefreshIntervalMs)
-                    continue;
-                scheduled.add(canonical);
-                // At most two rooms per 12-hour cycle, deterministically spread over
-                // ten minutes so multiple instances do not create a synchronized burst.
-                const jitterMs = Number.parseInt(createHash("sha256").update(canonical).digest("hex").slice(0, 8), 16) % (10 * 60_000);
-                this.#scheduleGroupMemberSync(bot.id, canonical, 60_000 + jitterMs);
-                if (scheduled.size >= GROUP_MEMBER_PERIODIC_REQUEST_BUDGET)
-                    return;
-            }
-        }
-    }
-    #noteGroupMemberRefreshFailure(roomId, error) {
-        const failures = Math.min(10, (this.#groupMemberRefreshFailures.get(roomId) ?? 0) + 1);
-        this.#groupMemberRefreshFailures.set(roomId, failures);
-        const delayMs = isWechatIpadSessionInvalidError(error)
-            ? GROUP_MEMBER_RISK_BACKOFF_MS
-            : Math.min(GROUP_MEMBER_RISK_BACKOFF_MS, 15 * 60_000 * (2 ** (failures - 1)));
-        const until = Date.now() + delayMs;
-        this.#groupMemberRefreshBackoffUntil.set(roomId, until);
-        return until;
-    }
-    #recordNativeGroupPresenceEvent(event) {
-        if (event.conversation.kind !== "group" || event.metadata?.interaction !== "system-event")
-            return;
-        const kind = event.metadata.systemEventKind;
-        const direction = kind === "group-member-joined"
-            ? "joined"
-            : kind === "group-member-left" || kind === "group-member-removed"
-                ? "left"
-                : undefined;
-        if (!direction || !Array.isArray(event.metadata.systemEventMemberNames))
-            return;
-        const roomId = canonicalConversationId(event.conversation.id);
-        const observedAt = event.timestamp ?? Date.now();
-        for (const value of event.metadata.systemEventMemberNames) {
-            if (typeof value !== "string")
-                continue;
-            const name = presenceNameKey(value);
-            if (name)
-                this.#nativePresenceEventAt.set(`${roomId}:${direction}:name:${name}`, observedAt);
-        }
-        if (Array.isArray(event.metadata.systemEventMemberIds)) {
-            for (const value of event.metadata.systemEventMemberIds) {
-                if (typeof value !== "string")
-                    continue;
-                const id = canonicalIdentityId(value);
-                if (id)
-                    this.#nativePresenceEventAt.set(`${roomId}:${direction}:id:${id}`, observedAt);
-            }
-        }
-        if (this.#nativePresenceEventAt.size > 2000) {
-            const cutoff = Date.now() - 10 * 60_000;
-            for (const [key, timestamp] of this.#nativePresenceEventAt) {
-                if (timestamp < cutoff)
-                    this.#nativePresenceEventAt.delete(key);
-            }
-        }
-    }
-    async #syncGroupMemberChanges(roomId, sourceBotId) {
-        const candidates = this.#fusionBotsForRoom(roomId)
-            .filter((bot) => bot.enabled && bot.channel.type === "wechat-ipad" && this.#runtimes.get(bot.id)?.channel.listGroupMembers);
-        const source = this.#store.getBot(sourceBotId);
-        if (source?.enabled && source.channel.type === "wechat-ipad" && !candidates.some((bot) => bot.id === source.id)) {
-            candidates.unshift(source);
-        }
-        let selected;
-        let members;
-        let lastError;
-        let sawEmptySnapshot = false;
-        let largestUnavailableCount = 0;
-        let removedUnavailableRoom = false;
-        for (const candidate of candidates) {
-            const managed = this.#runtimes.get(candidate.id);
-            if (!managed?.runtime.running || !managed.channel.listGroupMembers)
-                continue;
-            try {
-                const current = await managed.channel.listGroupMembers(roomId);
-                if (current.length === 0) {
-                    sawEmptySnapshot = true;
-                    const unavailable = this.#deactivateGroupRoom(candidate.id, roomId, "empty-member-snapshot", false);
-                    largestUnavailableCount = Math.max(largestUnavailableCount, unavailable.consecutive);
-                    removedUnavailableRoom ||= unavailable.inactive;
-                    continue;
-                }
-                this.#activateGroupRoom(candidate.id, roomId);
-                selected = candidate;
-                members = current;
-                break;
-            }
-            catch (error) {
-                lastError = error;
-            }
-        }
-        if (!selected || !members) {
-            if (sawEmptySnapshot && !lastError) {
-                if (!removedUnavailableRoom) {
-                    this.#groupMemberRefreshBackoffUntil.set(roomId, Date.now() + MIN_GROUP_MEMBER_REFRESH_INTERVAL_MS);
-                    this.#log("debug", "channel", "group.members_unavailable", "群成员快照为空，等待下一轮确认后自动移除", { conversationId: roomId, consecutiveUnavailable: largestUnavailableCount }, sourceBotId);
-                }
-                return;
-            }
-            throw lastError ?? new Error("No running iPad channel can read this group's members");
-        }
-        this.#groupMemberRefreshBackoffUntil.delete(roomId);
-        this.#groupMemberRefreshFailures.delete(roomId);
-        this.#groupMemberLastSuccessfulRefreshAt.set(roomId, Date.now());
-        const snapshot = this.#store.syncGroupMemberSnapshots(roomId, members);
-        const botIdentities = new Set(this.#store.listBots().map((bot) => canonicalIdentityId(bot.identityId)));
-        const memberNames = new Map();
-        for (const member of members) {
-            const memberId = canonicalIdentityId(member.id);
-            const displayName = safeGroupDisplayName(member.displayName?.trim() || member.nickname?.trim(), member.id, "");
-            if (!displayName)
-                continue;
-            memberNames.set(memberId, displayName);
-            this.#sharedConversationState.store.upsertMember(roomId, {
-                id: memberId,
-                displayName,
-                isBot: botIdentities.has(memberId),
-            });
-        }
-        this.#groupMemberCache.set(roomId, {
-            expiresAt: Date.now() + 30 * 60_000,
-            members: memberNames,
-        });
-        const now = Date.now();
-        const joined = snapshot.joined.filter((member) => !this.#recentNativePresenceEvent(roomId, "joined", member.id, member.name, now));
-        const left = snapshot.left.filter((member) => !this.#recentNativePresenceEvent(roomId, "left", member.id, member.name, now));
-        if (snapshot.initialized || (snapshot.changes.length === 0 && joined.length === 0 && left.length === 0)) {
-            this.#log("debug", "channel", snapshot.initialized ? "group.members_baselined" : "group.members_refreshed", snapshot.initialized ? "已建立群成员名片基线" : "群成员资料已刷新，无可见昵称变化", { conversationId: roomId, memberCount: members.length }, selected.id);
-            return;
-        }
-        const sections = [];
-        if (joined.length > 0)
-            sections.push(`欢迎${joined.slice(0, 10).map((item) => safeNotificationName(item.name)).join("、")}入群`);
-        if (left.length > 0)
-            sections.push(`${left.slice(0, 10).map((item) => safeNotificationName(item.name)).join("、")}退出了群聊`);
-        if (snapshot.changes.length > 0) {
-            const visible = snapshot.changes.slice(0, 10);
-            const lines = visible.map((change) => `「${safeNotificationName(change.oldName)}」改成了「${safeNotificationName(change.newName)}」`);
-            if (snapshot.changes.length > visible.length)
-                lines.push(`另有 ${snapshot.changes.length - visible.length} 位成员也更新了群名片`);
-            sections.push(["📇 群名片更新", ...lines].join("\n"));
-        }
-        const text = sections.join("\n");
-        const managed = this.#runtimes.get(selected.id);
-        if (!managed)
-            throw new Error(`Selected iPad bot ${selected.id} stopped before sending the group-name notification`);
-        const requestId = `group-member-name:${createHash("sha256")
-            .update(`${roomId}\u0000${text}`)
-            .digest("hex")}`;
-        const result = await managed.runtime.sendProactiveText({
-            id: requestId,
-            kind: "admin-message",
-            conversationId: this.#localConversationId(selected, roomId),
-            prompt: "微信协议检测到群成员或群名片变化；这是不调用模型的确定性通知。",
-            timestamp: Date.now(),
-        }, text);
-        this.#log("info", "channel", "group.members_changed", "已发送群成员变化通知", {
-            conversationId: roomId,
-            changes: snapshot.changes,
-            joined,
-            left,
-            delivered: result.delivery.delivered.length,
-        }, selected.id);
-    }
-    #recentNativePresenceEvent(roomId, direction, memberId, name, now) {
-        const timestamps = [
-            this.#nativePresenceEventAt.get(`${roomId}:${direction}:id:${canonicalIdentityId(memberId)}`),
-            this.#nativePresenceEventAt.get(`${roomId}:${direction}:name:${presenceNameKey(name)}`),
-        ];
-        return timestamps.some((timestamp) => timestamp !== undefined && Math.abs(now - timestamp) <= 30_000);
-    }
+
+
     async #claimSharedReply(config, event, reason) {
         if (event.conversation.kind !== "group")
             return true;
@@ -2177,7 +1913,7 @@ export class AgentSupervisor {
         const preferred = roomBots[0];
         const claimKey = `shared-reply:${sharedReplyFingerprint(event)}`;
         if (preferred.id !== config.id) {
-            // Always give the stable primary a short head start. A protocol health
+            // Always give the stable primary a short head start. A channel health
             // endpoint can be stale or endpoint-specific; if the primary really did
             // not receive this event, the backup still takes over after the grace.
             await new Promise((resolveWait) => {
@@ -2213,44 +1949,6 @@ export class AgentSupervisor {
             fingerprint: claimKey.slice(13),
         }, config.id);
     }
-    async #forwardGroupEventToIpad(source, event) {
-        if (event.conversation.kind !== "group" || !isPortableGroupEvent(event))
-            return undefined;
-        const roomId = canonicalConversationId(event.conversation.id);
-        const ipad = (await this.#healthyFusionBotsForRoom(roomId, true))
-            .find((bot) => bot.channel.type === "wechat-ipad");
-        if (!ipad || ipad.id === source.id)
-            return undefined;
-        const target = this.#runtimes.get(ipad.id);
-        if (!target?.runtime.running)
-            return undefined;
-        const forwarded = forwardGroupEvent(event, ipad, source.id);
-        try {
-            const result = await target.runtime.ingest(forwarded);
-            if (result.delivery.failed.length > 0) {
-                this.#log("warn", "channel", "reply.ipad_delivery_pending", "iPad 已生成回复但发送暂时失败，已保留在 iPad outbox 等待重试", {
-                    sourceBotId: source.id,
-                    chatroomId: roomId,
-                    eventId: event.id,
-                    failures: result.delivery.failed,
-                }, ipad.id);
-            }
-            this.#log("info", "agent", "reply.forwarded_to_ipad", "wxhook 收到的群消息已交由首选 iPad 机器人处理", {
-                sourceBotId: source.id,
-                chatroomId: roomId,
-                sourceEventId: event.id,
-                forwardedEventId: forwarded.id,
-                handlingStatus: result.handling.status,
-                delivered: result.delivery.delivered.length,
-                pending: result.delivery.failed.length,
-            }, ipad.id);
-            return { kind: "ignore", reason: "forwarded-to-ipad-primary" };
-        }
-        catch (error) {
-            this.#log("warn", "agent", "reply.ipad_forward_failed", "首选 iPad 机器人处理失败，当前消息回退给 wxhook", { sourceBotId: source.id, chatroomId: roomId, eventId: event.id, error: errorMessage(error) }, ipad.id);
-            return undefined;
-        }
-    }
     async #notifyModelFallback(details) {
         const configuredRecipient = this.#env.PI_FALLBACK_NOTIFY_USER?.trim();
         if (!configuredRecipient)
@@ -2263,7 +1961,7 @@ export class AgentSupervisor {
         this.#fallbackNotificationAt.set(dedupeKey, now);
         const candidates = this.#store.listBots()
             .filter((bot) => bot.enabled && this.#runtimes.get(bot.id)?.runtime.running)
-            .sort((left, right) => (left.channel.type === "wechat-ipad" ? 0 : 1) - (right.channel.type === "wechat-ipad" ? 0 : 1));
+            .sort((left, right) => left.id.localeCompare(right.id));
         const target = candidates.find((bot) => this.#states.get(bot.id)?.gatewayHealthy !== false);
         const managed = target ? this.#runtimes.get(target.id) : undefined;
         if (!target || !managed) {
@@ -2303,7 +2001,7 @@ export class AgentSupervisor {
     }
     #rememberBotRoom(botId, conversationId) {
         const roomId = canonicalConversationId(conversationId);
-        if (!roomId.endsWith("@chatroom"))
+        if (!roomId)
             return;
         const botIds = this.#roomBots.get(roomId) ?? new Set();
         botIds.add(botId);
@@ -2349,8 +2047,8 @@ export class AgentSupervisor {
         return candidates.filter((bot) => this.#states.get(bot.id)?.gatewayHealthy === true);
     }
     #assertChatroomId(chatroomId) {
-        if (!chatroomId.endsWith("@chatroom"))
-            throw new Error("chatroomId must be a WeChat @chatroom id");
+        if (!chatroomId)
+            throw new Error("chatroomId must not be empty");
     }
     #assertChatroomAccess(botId, chatroomId) {
         if (!this.#store.getBot(botId))
@@ -2433,7 +2131,7 @@ export class AgentSupervisor {
                         break;
                 }
                 catch {
-                    // A bot may not be a member of every room. Try the next read-only protocol client.
+                    // An adapter may not know every room title. Try the next snapshot.
                 }
             }
             this.#groupTitleCache.set(canonical, {
@@ -2458,8 +2156,7 @@ export class AgentSupervisor {
             if (displayName && !members.has(id))
                 members.set(id, displayName);
         }
-        // Keep nickname resolution working even when the iPad account has already
-        // left a group: previously observed names are durable in each bot store.
+        // Previously observed names are durable in each bot store.
         for (const bot of this.#store.listBots()) {
             const namespace = bot.channel.accountId?.trim();
             const conversationIds = [...new Set([roomId, ...(namespace ? [`${namespace}:${roomId}`] : [])])];
@@ -2479,8 +2176,8 @@ export class AgentSupervisor {
             }
         }
         // Nickname resolution is on the inbound-message hot path. Never issue a
-        // complete member-detail request here: native contact callbacks and the
-        // low-frequency reconciler update these durable snapshots out of band.
+        // Adapters can enrich the snapshot through standard event metadata; this
+        // hot path only reads local durable names.
         if (this.#groupMemberCache.size >= 500) {
             const oldest = this.#groupMemberCache.keys().next().value;
             if (oldest)
@@ -2654,7 +2351,6 @@ export class AgentSupervisor {
                         this.#log("error", "agent", "plugin.tick_failed", errorMessage(error), { pluginId: plugin.id, pluginType: plugin.type }, config.id);
                     }
                 }
-                await this.#runWechatMomentAutomation(config, managed, now);
                 if (!config.socialSchedule.enabled)
                     continue;
                 const clock = localClock(now, config.socialSchedule.timezoneOffsetMinutes);
@@ -2673,78 +2369,6 @@ export class AgentSupervisor {
         }
         finally {
             this.#socialPollRunning = false;
-        }
-    }
-    async #runWechatMomentAutomation(config, managed, now) {
-        const settings = this.#store.getWechatMomentAutomation(config.id);
-        if (!settings.enabled || config.channel.type !== "wechat-ipad" || !managed.channel.wechat)
-            return;
-        const lastPoll = this.#momentAutomationPolledAt.get(config.id) ?? 0;
-        if (now - lastPoll < 5 * 60_000)
-            return;
-        this.#momentAutomationPolledAt.set(config.id, now);
-        const allowed = new Set(settings.allowedAuthorWxids.map(canonicalIdentityId));
-        try {
-            const moments = momentAutomationCandidates(await managed.channel.wechat.listMoments(), config.channel.accountWxid)
-                .filter((moment) => allowed.has(canonicalIdentityId(moment.authorWxid)))
-                .filter((moment) => moment.createdAt >= now - settings.lookbackMinutes * 60_000)
-                .sort((left, right) => right.createdAt - left.createdAt);
-            for (const moment of moments) {
-                const plans = [];
-                if (settings.autoLike && !moment.likedByBot)
-                    plans.push({ action: "like" });
-                if (settings.autoComment && !moment.commentedByBot) {
-                    const index = [...moment.id].reduce((sum, value) => sum + value.codePointAt(0), 0) % settings.commentTemplates.length;
-                    plans.push({ action: "comment", content: settings.commentTemplates[index] });
-                }
-                for (const plan of plans) {
-                    const claim = this.#store.claimWechatMomentAction({
-                        botId: config.id,
-                        momentId: moment.id,
-                        authorWxid: moment.authorWxid,
-                        action: plan.action,
-                        ...(plan.content ? { content: plan.content } : {}),
-                        maxActionsPerDay: settings.maxActionsPerDay,
-                        minIntervalMinutes: settings.minIntervalMinutes,
-                        now,
-                    });
-                    if (!claim.claimed || !claim.id)
-                        continue;
-                    if (settings.dryRun) {
-                        this.#store.completeWechatMomentAction(claim.id, "dry_run");
-                        this.#log("info", "channel", "wechat.moment_automation_dry_run", "朋友圈自动互动 dry-run 命中", {
-                            momentId: moment.id,
-                            authorWxid: moment.authorWxid,
-                            action: plan.action,
-                        }, config.id);
-                        return;
-                    }
-                    try {
-                        if (plan.action === "like")
-                            await managed.channel.wechat.likeMoment(moment.id);
-                        else
-                            await managed.channel.wechat.commentMoment(moment.id, plan.content);
-                        this.#store.completeWechatMomentAction(claim.id, "delivered");
-                        this.#log("info", "channel", "wechat.moment_automation_delivered", "朋友圈自动互动已执行", {
-                            momentId: moment.id,
-                            authorWxid: moment.authorWxid,
-                            action: plan.action,
-                        }, config.id);
-                    }
-                    catch (error) {
-                        this.#store.completeWechatMomentAction(claim.id, "failed", errorMessage(error));
-                        this.#log("warn", "channel", "wechat.moment_automation_failed", errorMessage(error), {
-                            momentId: moment.id,
-                            authorWxid: moment.authorWxid,
-                            action: plan.action,
-                        }, config.id);
-                    }
-                    return;
-                }
-            }
-        }
-        catch (error) {
-            this.#log("warn", "channel", "wechat.moment_automation_poll_failed", errorMessage(error), undefined, config.id);
         }
     }
     async #runGoodnight(config, managed, now, dateKey) {
@@ -2874,41 +2498,17 @@ export class AgentSupervisor {
         const previous = this.#states.get(id)?.gatewayHealthy;
         try {
             const health = await managed.channel.health();
-            let healthy = gatewayHealthReady(config, health);
-            const invalidSession = this.#ipadSessionInvalid.get(id);
-            if (config.channel.type === "wechat-ipad" && invalidSession) {
-                healthy = false;
-                const now = Date.now();
-                if (health.loggedIn === true && now - invalidSession.lastValidationAttemptAt >= IPAD_SESSION_REVALIDATE_INTERVAL_MS) {
-                    invalidSession.lastValidationAttemptAt = now;
-                    try {
-                        if (!managed.channel.wechat)
-                            throw new Error("iPad session validation client is unavailable");
-                        await managed.channel.wechat.getAccountProfile();
-                        this.#ipadSessionInvalid.delete(id);
-                        healthy = true;
-                        const state = this.#states.get(id);
-                        if (state?.lastError === IPAD_SESSION_INVALID_MESSAGE)
-                            state.lastError = null;
-                        this.#log("info", "channel", "gateway.session_restored", "iPad 账号会话已通过认证接口重新确认", undefined, id);
-                    }
-                    catch {
-                        // A heartbeat/cache hit is insufficient while a terminal session
-                        // error is latched. Stay offline until an authenticated probe works.
-                    }
-                }
-            }
+            const healthy = gatewayHealthReady(config, health);
             this.#setGatewayHealth(id, healthy);
             if (forceLog || previous !== healthy) {
-                this.#log(healthy ? "info" : "warn", "channel", healthy ? "gateway.healthy" : "gateway.account_offline", healthy ? "微信网关与账号均健康" : "微信网关可达，但机器人账号未登录或工作进程未存活", health, id);
+                this.#log(healthy ? "info" : "warn", "channel", healthy ? "channel.healthy" : "channel.unhealthy", healthy ? "通道健康检查通过" : "通道报告不可用", health, id);
             }
             return { health, healthy };
         }
         catch (error) {
             this.#setGatewayHealth(id, false);
-            if (forceLog || previous !== false) {
-                this.#log("error", "channel", "gateway.unhealthy", errorMessage(error), undefined, id);
-            }
+            if (forceLog || previous !== false)
+                this.#log("error", "channel", "channel.health_failed", errorMessage(error), undefined, id);
             throw error;
         }
     }
@@ -2919,39 +2519,7 @@ export class AgentSupervisor {
         state.gatewayHealthy = healthy;
         state.gatewayCheckedAt = Date.now();
     }
-    #handleIpadSessionInvalid(id, error) {
-        if (!isWechatIpadSessionInvalidError(error))
-            return;
-        const now = Date.now();
-        const existing = this.#ipadSessionInvalid.get(id);
-        this.#ipadSessionInvalid.set(id, existing ?? { observedAt: now, lastValidationAttemptAt: 0 });
-        const state = this.#states.get(id);
-        if (state) {
-            state.gatewayHealthy = false;
-            state.gatewayCheckedAt = now;
-            state.lastError = IPAD_SESSION_INVALID_MESSAGE;
-        }
-        if (!existing) {
-            this.#log("error", "channel", "gateway.session_invalid", IPAD_SESSION_INVALID_MESSAGE, {
-                protocolError: errorMessage(error),
-            }, id);
-        }
-    }
-    #handleIpadSessionActivity(id, observedAt) {
-        const state = this.#states.get(id);
-        const wasInvalid = this.#ipadSessionInvalid.delete(id);
-        const wasOffline = state?.gatewayHealthy === false;
-        if (state) {
-            state.gatewayHealthy = true;
-            state.gatewayCheckedAt = observedAt;
-            if (state.lastError === IPAD_SESSION_INVALID_MESSAGE)
-                state.lastError = null;
-        }
-        if (wasInvalid || wasOffline) {
-            this.#log("info", "channel", "gateway.session_activity_restored", "收到新的 iPad 原生消息，已确认账号会话仍在活动", { observedAt }, id);
-            this.#rebalanceFusionScheduledTasks();
-        }
-    }
+
     #log(level, scope, event, message, details, botId) {
         try {
             this.#store.appendLog({ level, scope, event, message, ...(details ? { details } : {}), ...(botId ? { botId } : {}) });
@@ -3015,6 +2583,54 @@ function isChatGeminiModelId(modelId) {
     return modelId.startsWith("gemini-") &&
         !/(?:embedding|imagen|veo|tts|robotics|computer-use)/u.test(modelId);
 }
+function isGeminiChatProfile(profile, provider) {
+    return profile.enabled &&
+        profile.input.includes("text") &&
+        provider?.enabled === true &&
+        isChatGeminiModelId(normalizedGeminiModelId(profile.modelId));
+}
+function isGeminiVisionProfile(profile, provider) {
+    return isGeminiChatProfile(profile, provider) && profile.input.includes("image");
+}
+function selectGeminiVisionProfileId(preferredIds, profiles) {
+    const byId = new Map(profiles.map((profile) => [profile.id, profile]));
+    for (const id of preferredIds) {
+        if (id && byId.has(id))
+            return id;
+    }
+    const order = [
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.1-pro-preview",
+        "gemini-3-flash-preview",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-2.5-flash-lite",
+    ];
+    return profiles
+        .slice()
+        .sort((left, right) => {
+        const leftModelId = normalizedGeminiModelId(left.modelId);
+        const rightModelId = normalizedGeminiModelId(right.modelId);
+        const leftRank = order.indexOf(leftModelId);
+        const rightRank = order.indexOf(rightModelId);
+        return (leftRank < 0 ? order.length : leftRank) - (rightRank < 0 ? order.length : rightRank) ||
+            leftModelId.localeCompare(rightModelId) ||
+            left.id.localeCompare(right.id);
+    })[0]?.id;
+}
+function selectGeminiParticipationProfileId(preferredIds, profiles) {
+    const byId = new Map(profiles.map((profile) => [profile.id, profile]));
+    for (const id of preferredIds) {
+        if (id && byId.has(id))
+            return id;
+    }
+    return profiles
+        .slice()
+        .sort((left, right) => normalizedGeminiModelId(left.modelId).localeCompare(normalizedGeminiModelId(right.modelId)) || left.id.localeCompare(right.id))[0]?.id;
+}
 /** Routes only obviously bounded social turns to the optional low-cost fast model. */
 export function shouldUseFastChatModel(event) {
     if (event.metadata?.proactiveKind || event.replyTo || (event.attachments?.length ?? 0) > 0)
@@ -3046,16 +2662,12 @@ function safeNotificationName(value) {
     const normalized = value.normalize("NFKC").replace(/[\u0000-\u001f\u007f]/gu, " ").trim();
     return [...normalized].slice(0, 80).join("") || "未命名成员";
 }
-function presenceNameKey(value) {
-    return value.normalize("NFKC").replace(/[\u0000-\u001f\u007f\s]/gu, "").trim().toLocaleLowerCase();
-}
 function botConfiguredForRoom(bot, roomId) {
     const canonical = canonicalConversationId(roomId);
     return bot.chatroomModelOverrides.some((item) => canonicalConversationId(item.chatroomId) === canonical);
 }
 function fusionBotPriority(left, right) {
-    const channelPriority = (bot) => bot.channel.type === "wechat-ipad" ? 0 : 1;
-    return channelPriority(left) - channelPriority(right) || left.id.localeCompare(right.id);
+    return left.id.localeCompare(right.id);
 }
 function fusedBotConfiguration(source, target, sharedRoomIds) {
     const sourceByRoom = new Map(source.chatroomModelOverrides.map((item) => [canonicalConversationId(item.chatroomId), item]));
@@ -3106,46 +2718,17 @@ function chatroomOverrideEmpty(override) {
         override.pluginOverrides.length === 0;
 }
 export function gatewayHealthReady(config, health) {
-    if (config.channel.type === "wechat-ipad")
-        return health.loggedIn === true;
-    return health.ok === true && (health.worker_alive === true || health.worker_process_alive === true);
+    void config;
+    if (typeof health.healthy === "boolean")
+        return health.healthy;
+    if (typeof health.ok === "boolean")
+        return health.ok;
+    return true;
 }
 export function selectReplyBot(bots, healthyBotIds, mentionedIdentityIds) {
     const healthy = bots.filter((bot) => healthyBotIds.has(bot.id)).sort(fusionBotPriority);
     void mentionedIdentityIds;
     return healthy[0];
-}
-function isPortableGroupEvent(event) {
-    return (event.parts ?? []).every((part) => part.type === "text" || part.type === "mention" || part.type === "link" || part.type === "quote");
-}
-function forwardGroupEvent(event, target, sourceBotId) {
-    const accountId = target.channel.accountId?.normalize("NFKC").trim();
-    const qualify = (value) => {
-        const canonical = canonicalIdentityId(value);
-        return accountId ? `${accountId}:${canonical}` : canonical;
-    };
-    const fingerprint = sharedReplyFingerprint(event).slice(0, 32);
-    const nativeMessageId = /:(?:ipadmsg|wxmsg):(.+)$/u.exec(event.id)?.[1] ?? fingerprint;
-    return {
-        ...event,
-        id: `${accountId ? `${accountId}:` : ""}wxmsg:${nativeMessageId}`,
-        conversation: { ...event.conversation, id: accountId ? `${accountId}:${canonicalConversationId(event.conversation.id)}` : canonicalConversationId(event.conversation.id) },
-        sender: { ...event.sender, id: qualify(event.sender.id) },
-        mentions: (event.mentions ?? []).map((mention) => ({ ...mention, id: qualify(mention.id) })),
-        parts: (event.parts ?? []).map((part) => {
-            if (part.type === "mention")
-                return { ...part, memberId: qualify(part.memberId) };
-            if (part.type === "quote") {
-                return {
-                    ...part,
-                    messageId: `${accountId ? `${accountId}:` : ""}forwarded-quote:${createHash("sha256").update(part.messageId).digest("hex").slice(0, 24)}`,
-                    ...(part.senderId ? { senderId: qualify(part.senderId) } : {}),
-                };
-            }
-            return part;
-        }),
-        metadata: { ...(event.metadata ?? {}), forwardedFromBotId: sourceBotId },
-    };
 }
 function canonicalIdentityId(value) {
     const normalized = value.normalize("NFKC").trim().toLocaleLowerCase();
@@ -3174,15 +2757,14 @@ function isConversationManager(config, conversationId, senderId) {
         .some((id) => canonicalIdentityId(id) === actor);
 }
 export function sharedReplyFingerprint(event) {
-    const nativeMessageId = /:(?:ipadmsg|wxmsg):(.+)$/u.exec(event.id)?.[1];
     const content = (event.text ?? "").normalize("NFKC").trim().replace(/\s+/gu, " ");
-    const payload = nativeMessageId
-        ? [canonicalConversationId(event.conversation.id), `native:${nativeMessageId}`]
+    const payload = event.transportMessageId
+        ? [canonicalConversationId(event.conversation.id), `transport:${event.transportMessageId}`]
         : [
             canonicalConversationId(event.conversation.id),
             canonicalIdentityId(event.sender.id),
             String(Math.floor((event.timestamp ?? 0) / 2000)),
-            String(event.metadata?.nativeType ?? ""),
+            String(event.metadata?.messageType ?? ""),
             content,
         ];
     return createHash("sha256").update(payload.join("\u0000")).digest("hex");
@@ -3258,22 +2840,12 @@ function requiredSecret(env, name) {
         throw new Error(`Required secret environment variable ${name} is not set`);
     return value;
 }
-function validatedWebhookUrl(value, expectedPath) {
-    let url;
-    try {
-        url = new URL(value);
-    }
-    catch {
-        throw new Error("Webhook URL must be an absolute URL");
-    }
-    if (url.protocol !== "http:" && url.protocol !== "https:")
-        throw new Error("Webhook URL must use HTTP or HTTPS");
-    if (url.username || url.password || url.search || url.hash) {
-        throw new Error("Webhook URL cannot contain credentials, query, or fragment");
-    }
-    if (url.pathname !== expectedPath)
-        throw new Error(`Webhook URL path must be ${expectedPath}`);
-    return url.toString();
+function channelTimeoutMs(channel) {
+    const value = channel.settings?.timeoutMs;
+    return Number.isSafeInteger(value) && value > 0 ? value : 120_000;
+}
+function hasEmojiImage(event) {
+    return (event.parts ?? []).some((part) => part.type === "image" && part.asset.metadata?.kind === "emoji");
 }
 function safeDataPath(dataDirectory, relativePath) {
     const path = resolve(dataDirectory, relativePath);
@@ -3327,74 +2899,6 @@ function traceMessage(event) {
 }
 function errorMessage(error) {
     return error instanceof Error ? error.message : String(error);
-}
-function imageDataUrlBytes(value) {
-    const match = /^data:image\/(?:jpeg|png|webp);base64,([a-zA-Z0-9+/=]+)$/u.exec(value);
-    if (!match)
-        throw new Error("Persona avatar is not a supported image data URL");
-    const bytes = Buffer.from(match[1], "base64");
-    if (bytes.byteLength < 16 || bytes.byteLength > 5 * 1024 * 1024) {
-        throw new Error("Persona avatar size must be between 16 bytes and 5 MiB");
-    }
-    return bytes;
-}
-export function momentAutomationCandidates(value, accountWxid) {
-    const list = findProtocolArray(value, "ObjectList");
-    if (!list)
-        return [];
-    return list.flatMap((item) => {
-        const record = plainRecord(item);
-        if (!record)
-            return [];
-        const id = protocolText(record.Id);
-        const authorWxid = protocolText(record.Username);
-        const createdSeconds = Number(protocolText(record.CreateTime));
-        if (!id || !/^\d{1,30}$/u.test(id) || !authorWxid || !Number.isSafeInteger(createdSeconds) || createdSeconds <= 0)
-            return [];
-        const likeUsers = Array.isArray(record.LikeUserList) ? record.LikeUserList : [];
-        const commentUsers = Array.isArray(record.CommentUserList) ? record.CommentUserList : [];
-        const includesAccount = (items) => items.some((entry) => {
-            const user = plainRecord(entry);
-            return canonicalIdentityId(protocolText(user?.Username) ?? "") === canonicalIdentityId(accountWxid);
-        });
-        return [{
-                id,
-                authorWxid,
-                createdAt: createdSeconds * 1000,
-                likedByBot: Number(protocolText(record.LikeFlag) ?? "0") > 0 || includesAccount(likeUsers),
-                commentedByBot: includesAccount(commentUsers),
-            }];
-    });
-}
-function findProtocolArray(value, key, depth = 0) {
-    if (depth > 6)
-        return undefined;
-    const record = plainRecord(value);
-    if (!record)
-        return undefined;
-    if (Array.isArray(record[key]))
-        return record[key];
-    for (const nested of Object.values(record)) {
-        const found = findProtocolArray(nested, key, depth + 1);
-        if (found)
-            return found;
-    }
-    return undefined;
-}
-function plainRecord(value) {
-    return typeof value === "object" && value !== null && !Array.isArray(value)
-        ? value
-        : undefined;
-}
-function protocolText(value) {
-    if (typeof value === "string")
-        return value;
-    if (typeof value === "number" && Number.isSafeInteger(value))
-        return String(value);
-    const record = plainRecord(value);
-    return typeof record?.string === "string" ? record.string
-        : typeof record?.String === "string" ? record.String
-            : undefined;
 }
 function isTransientAudioTranscriptionError(error) {
     return /(?:\b(?:429|500|502|503|504)\b|fetch failed|network|econn|timed?\s*out|temporar|rate limit|too many requests)/iu.test(errorMessage(error));

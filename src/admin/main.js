@@ -4,19 +4,19 @@ import { resolve } from "node:path";
 import { AdminStore } from "./admin-store.js";
 import { AdminServer } from "./server.js";
 import { AgentSupervisor } from "./supervisor.js";
-import { WechatIpadLoginManager } from "./wechat-ipad-login.js";
+import { loadChannelAdapterRegistry } from "./adapter-loader.js";
 const dataDirectory = resolve(process.env.PI_AGENT_DATA_DIR ?? "./data");
 const databasePath = resolve(dataDirectory, "admin.sqlite");
 const token = await loadAdminToken(dataDirectory);
 const secretKey = await loadAdminSecretKey(dataDirectory);
 const store = new AdminStore(databasePath, { secretKey });
+const adapterRegistry = await loadChannelAdapterRegistry();
 const supervisor = new AgentSupervisor({
     store,
     dataDirectory,
+    adapterRegistry,
     healthIntervalMs: environmentInteger("PI_GATEWAY_HEALTH_INTERVAL_MS", 30_000, 5000, 10 * 60_000),
-    groupMemberRefreshIntervalMs: environmentInteger("PI_GROUP_MEMBER_REFRESH_INTERVAL_MS", 12 * 60 * 60_000, 60 * 60_000, 7 * 24 * 60 * 60_000),
 });
-const ipadLoginManager = new WechatIpadLoginManager({ store, supervisor });
 const server = new AdminServer({
     store,
     supervisor,
@@ -24,7 +24,7 @@ const server = new AdminServer({
     host: process.env.PI_WEBUI_HOST ?? "0.0.0.0",
     port: environmentInteger("PI_WEBUI_PORT", 8787, 1, 65_535),
     allowPublicClients: process.env.PI_WEBUI_ALLOW_PUBLIC === "true",
-    ipadLoginManager,
+    adapterRegistry,
 });
 let stopping = false;
 async function shutdown(signal) {
@@ -41,7 +41,7 @@ process.once("SIGINT", () => void shutdown("SIGINT").then(() => process.exit(0))
 try {
     await supervisor.start();
     const address = await server.start();
-    process.stdout.write(`pi-wechat-agent WebUI listening on ${address.host}:${address.port}\n`);
+    process.stdout.write(`pi-bot WebUI listening on ${address.host}:${address.port}\n`);
     process.stdout.write(`Admin token file: ${resolve(dataDirectory, "admin-token.txt")}\n`);
 }
 catch (error) {

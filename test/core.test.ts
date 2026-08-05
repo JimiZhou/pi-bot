@@ -8,12 +8,48 @@ import { createEmojiToolProvider } from "../src/emoji-library.js";
 import { InMemoryEmojiRepository } from "./in-memory-emoji-repository.js";
 import {
   GroupAgentCore,
+  SharedConversationState,
   type GroupAgentCoreOptions,
   type AgentRunner,
   type AgentRunRequest,
   type AgentRunResult,
   type InboundMessageEvent,
 } from "../src/index.js";
+
+test("proactive emoji replies are visible in shared group history", async (context) => {
+  const directory = mkdtempSync(join(process.cwd(), ".pi-bot-shared-emoji-"));
+  const shared = new SharedConversationState(join(directory, "shared.sqlite"));
+  const core = new GroupAgentCore({
+    bot: { id: "bot-1", displayName: "小派" },
+    runner: new RecordingRunner(),
+    databasePath: join(directory, "agent.sqlite"),
+    sharedConversationState: shared,
+  });
+  context.after(() => {
+    core.close();
+    shared.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  await core.receive(groupMessage("seed-emoji-history", "member", "群友", "普通群消息", {
+    conversation: { id: "room-group", kind: "group" },
+  }));
+  await core.sendProactiveMessage({
+    id: "proactive:emoji-history",
+    kind: "admin-message",
+    conversationId: "room-group",
+    prompt: "管理员发送表情",
+    timestamp: Date.now(),
+  }, "", [{
+    type: "image",
+    asset: { id: "emoji", source: "local", locator: "aa/emoji.gif" },
+    alt: "小猫点头",
+  }]);
+
+  const outbound = shared.store.listConversationMessages("room-group", { limit: 10 })
+    .find((message) => message.direction === "outbound");
+  assert.equal(outbound?.text, "[图片: 小猫点头]");
+});
 
 class RecordingRunner implements AgentRunner {
   readonly requests: AgentRunRequest[] = [];

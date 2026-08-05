@@ -1,5 +1,4 @@
 import type { BotAgentLimits, BotConfig, SocialScheduleConfig } from "@/types/admin"
-import { defaultWxHookChannel } from "@/extensions/wechat/channel-config"
 
 export const defaultBotLimits: BotAgentLimits = {
   historyLimit: 50,
@@ -39,7 +38,7 @@ export const defaultSocialSchedule: SocialScheduleConfig = {
   activeGroupMinMessages: 5,
 }
 
-export function createDefaultBot(id: string, port: number): BotConfig {
+export function createDefaultBot(id: string): BotConfig {
   return {
     id,
     enabled: false,
@@ -57,7 +56,7 @@ export function createDefaultBot(id: string, port: number): BotConfig {
     chatroomModelOverrides: [],
     imageUnderstandingEnabled: true,
     databaseFile: `bots/${id}/agent.sqlite`,
-    channel: defaultWxHookChannel(port),
+    channel: { type: "example", settings: {} },
     limits: { ...defaultBotLimits },
     socialSchedule: { ...defaultSocialSchedule },
     plugins: [],

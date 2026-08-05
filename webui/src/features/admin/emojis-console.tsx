@@ -1,5 +1,5 @@
 import { useCallback, useState, type FormEvent } from "react"
-import { Edit3, Laugh, Search } from "lucide-react"
+import { Edit3, Search } from "lucide-react"
 
 import {
   AdminFeedback,
@@ -10,6 +10,8 @@ import {
   TextareaField,
 } from "@/components/admin-primitives"
 import { EmptyState, PageHeader, StatusPill } from "@/components/console-primitives"
+import { EmojiPreview } from "@/components/emoji-preview"
+import MemeGeneratorPanel from "@/features/admin/meme-generator-panel"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -75,6 +77,7 @@ export default function EmojisConsole() {
         action={<ReloadButton loading={resource.refreshing} onClick={() => void resource.reload()} />}
       />
       <AdminFeedback error={resource.error} notice={resource.notice} />
+      <MemeGeneratorPanel onEmojiSaved={() => void resource.reload()} />
       <div className="relative max-w-lg">
         <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
         <Input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索描述或 ID" className="pl-8" />
@@ -87,9 +90,7 @@ export default function EmojisConsole() {
         {emojis.map((emoji) => (
           <Card key={emoji.id} className="shadow-none">
             <CardHeader>
-              <span className="mb-2 flex size-12 items-center justify-center rounded-xl bg-amber-50 text-amber-600 dark:bg-amber-950 dark:text-amber-300">
-                <Laugh className="size-6" />
-              </span>
+              <EmojiPreview emoji={emoji} className="mb-2 size-28 rounded-xl border" />
               <CardTitle>{emoji.description || "未命名表情"}</CardTitle>
               <CardDescription className="truncate font-mono">{emoji.id}</CardDescription>
               <CardAction><StatusPill label={emoji.enabled ? "已启用" : "已停用"} tone={emoji.enabled ? "positive" : "muted"} /></CardAction>
@@ -97,6 +98,9 @@ export default function EmojisConsole() {
             <CardContent className="flex flex-wrap gap-2">
               <Badge variant="outline">{emoji.mimeType}</Badge>
               <Badge variant="outline">{formatBytes(emoji.size)}</Badge>
+              <Badge variant={emoji.status === "failed" ? "destructive" : "outline"}>
+                {emoji.status === "failed" ? "识别失败·自动重试" : emoji.status === "analyzing" ? "识别中" : "已识别"}
+              </Badge>
               {emoji.isThinking ? <Badge variant="secondary">思考反馈</Badge> : null}
             </CardContent>
             <CardFooter className="justify-between">

@@ -49,6 +49,12 @@ export default function SettingsConsole() {
     { value: "", label: "未配置" },
     ...(payload?.models ?? []).map((model) => ({ value: model.id, label: model.label })),
   ]
+  const visionModelOptions = [
+    { value: "", label: "自动选择 Gemini 视觉模型" },
+    ...(payload?.models ?? [])
+      .filter((model) => model.input.includes("image"))
+      .map((model) => ({ value: model.id, label: model.label })),
+  ]
   return (
     <div className="space-y-6">
       <PageHeader
@@ -70,7 +76,7 @@ export default function SettingsConsole() {
             </CardHeader>
             <CardContent className="grid gap-4 sm:grid-cols-2">
               <SelectField label="默认聊天模型" name="defaultChatModelProfileId" defaultValue={settings.defaultChatModelProfileId ?? ""} options={modelOptions} />
-              <SelectField label="默认视觉模型" name="defaultVisionModelProfileId" defaultValue={settings.defaultVisionModelProfileId ?? ""} options={modelOptions} />
+              <SelectField label="默认视觉模型" name="defaultVisionModelProfileId" defaultValue={settings.defaultVisionModelProfileId ?? ""} options={visionModelOptions} />
               <SelectField
                 label="默认联网检索"
                 name="defaultKnowledgeProfileId"

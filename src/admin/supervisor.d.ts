@@ -1,4 +1,4 @@
-import { WechatIpadApiClient } from "../adapters/wechat-ipad.js";
+import { ChannelAdapterRegistry } from "../channel-adapter.js";
 import type { InboundMessageEvent, LearningAuditRecord, MemoryRecord, ParticipationCase, ParticipationCaseQuery, ParticipationLabel, ReplyQualityLabel, ParticipationSummary, StoredMessage } from "../types.js";
 import { AdminStore, type AdminLogLevel } from "./admin-store.js";
 import type { BotConfig, ModelProfile } from "./config.js";
@@ -118,7 +118,7 @@ export interface AgentSupervisorOptions {
     dataDirectory: string;
     healthIntervalMs?: number;
     socialIntervalMs?: number;
-    groupMemberRefreshIntervalMs?: number;
+    adapterRegistry?: ChannelAdapterRegistry;
     env?: Readonly<Record<string, string | undefined>>;
 }
 /** Reconciles durable bot definitions into independently restartable Core + ChannelRuntime instances. */
@@ -167,6 +167,13 @@ export declare class AgentSupervisor {
     }): MemoryRecord;
     confirmChatroomMemory(botId: string, chatroomId: string, memoryId: string, extendDays?: number): MemoryRecord;
     deleteChatroomMemory(botId: string, chatroomId: string, memoryId: string): void;
+    saveGeneratedEmoji(botId: string, input: {
+        data: Uint8Array;
+        mimeType: string;
+        name?: string;
+        description?: string;
+        memeKey?: string;
+    }): Promise<import("../emoji-library.js").EmojiRecord>;
     sendChatroomMessage(botId: string, chatroomId: string, input: {
         text?: string;
         emojiId?: string;
@@ -178,9 +185,8 @@ export declare class AgentSupervisor {
         emojiId?: string;
     }>;
     checkGateway(id: string): Promise<Record<string, unknown>>;
-    wechatClient(botId: string): WechatIpadApiClient;
-    wechatCapabilities(botId: string): Record<string, unknown>;
-    applyPersonaIdentity(botId: string, personaProfileId: string, options?: {
+    channelCapabilities(botId: string): Record<string, unknown>;
+    applyChannelIdentity(botId: string, personaProfileId: string, options?: {
         force?: boolean;
         conversationId?: string;
     }): Promise<Record<string, unknown>>;
@@ -213,13 +219,5 @@ export declare function selectReplyBot(bots: readonly BotConfig[], healthyBotIds
 export declare function sharedReplyFingerprint(event: InboundMessageEvent): string;
 /** Thinking feedback is only for the first model reply after an explicit group @mention. */
 export declare function shouldSendThinkingEmoji(event: InboundMessageEvent, botIdentityId: string | readonly string[], recentMessages: readonly StoredMessage[], continuationWindowMs: number): boolean;
-interface MomentAutomationCandidate {
-    id: string;
-    authorWxid: string;
-    createdAt: number;
-    likedByBot: boolean;
-    commentedByBot: boolean;
-}
-export declare function momentAutomationCandidates(value: unknown, accountWxid: string): MomentAutomationCandidate[];
 export {};
 //# sourceMappingURL=supervisor.d.ts.map

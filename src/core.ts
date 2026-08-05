@@ -587,6 +587,7 @@ export class GroupAgentCore {
       !baseDecision.respond &&
       (baseDecision.reason === "ambient-no-signal" || baseDecision.reason === "not-addressed") &&
       autoParticipationAllowed &&
+      this.#participationJudgeRunner &&
       this.#judgeCooldownExpired(event) &&
       recentConversationThread(triggerMessages, this.#bot.id, event.timestamp ?? Date.now(), this.#continuationWindowMs)
     ) {
@@ -677,7 +678,8 @@ export class GroupAgentCore {
       this.#continuationWindowMs,
     );
     if (!thread) return { respond: false, reason: "ambient-no-signal" };
-    const runner = this.#participationJudgeRunner ?? this.#runnerResolver?.(event) ?? this.#runner;
+    const runner = this.#participationJudgeRunner;
+    if (!runner) return { respond: false, reason: "ambient-no-signal" };
     const transcript = [...thread.slice(-6), {
       sequence: Number.MAX_SAFE_INTEGER,
       id: event.id,
@@ -694,56 +696,19 @@ export class GroupAgentCore {
     }));
     const result = await runner.run({
       systemPrompt: participationJudgeSystemPrompt(intensity),
-      prompt: `${JSON.stringify({
-        recentConversation: transcript,
+      prompt: JSON.stringify({
+        // Keep the schema before the changing transcript so Gemini's implicit
+        // prompt cache can reuse the largest possible prefix.
         outputSchema: {
           decision: "speak | silent",
           reason: "followup | correction | new_info | ack_only | human_to_human | topic_shift | no_value | uncertain",
           confidence: "number between 0 and 1",
         },
-        participationIntensity: intensity,
-        rules: [
-          "speak 只能搭配 followup、correction 或 new_info",
-          "silent 只能搭配 ack_only、human_to_human、topic_shift、no_value 或 uncertain",
-          "不确定当前消息是不是在对机器人说时选择 silent/uncertain",
-          "不要因为关键词相似就认定同一话题，要结合说话人和语义关系",
-        ],
-        examples: [
-          {
-            conversation: ["群友：球场从哪边走？", "机器人：从东门走最近。", "另一群友：东门出来就是那条小路吧？"],
-            output: { decision: "speak", reason: "followup", confidence: 0.9 },
-          },
-          {
-            conversation: ["机器人：活动九点开始。", "群友：通知刚改成十点了，你再确认下。"],
-            output: { decision: "speak", reason: "correction", confidence: 0.94 },
-          },
-          {
-            conversation: ["机器人：代理已经恢复。", "群友：那现在延迟大概多少？"],
-            output: { decision: "speak", reason: "followup", confidence: 0.95 },
-          },
-          {
-            conversation: ["机器人：文件已经发群里了。", "群友：好的，谢谢。"],
-            output: { decision: "silent", reason: "ack_only", confidence: 0.97 },
-          },
-          {
-            conversation: ["机器人：明天可能下雨。", "群友甲：老林，你明天有空吗？"],
-            output: { decision: "silent", reason: "human_to_human", confidence: 0.96 },
-          },
-          {
-            conversation: ["机器人：网络恢复了。", "群友：今晚吃什么？"],
-            output: { decision: "silent", reason: "topic_shift", confidence: 0.98 },
-          },
-          {
-            conversation: ["机器人：这个版本已经修好健康检查。", "群友：确实。"],
-            output: { decision: "silent", reason: "no_value", confidence: 0.92 },
-          },
-          {
-            conversation: ["机器人：可以从设置里打开。", "群友：那边呢？"],
-            output: { decision: "silent", reason: "uncertain", confidence: 0.64 },
-          },
-        ],
-      })}`,
-      sessionId: `participation-judge:${event.conversation.id}:${event.id}`,
+        recentConversation: transcript,
+      }),
+      // Keep the provider affinity key stable for this Bot and room. The
+      // transcript is already the changing suffix of the prompt.
+      sessionId: `participation-judge:${this.#sessionNamespace}:${event.conversation.id}:intensity:${intensity}`,
       tools: [],
       budget: { maxLlmCalls: 1, maxToolCalls: 0, timeoutMs: 20_000 },
     });
@@ -1069,6 +1034,7 @@ export class GroupAgentCore {
         });
         if (imageTool) tools.push(imageTool);
       }
+      const imageUnderstandingAvailable = tools.some((tool) => tool.name === "understand_image");
       if (context.mediaResolver) {
         const attachmentTool = createAttachmentInspectionTool({ event, mediaResolver: context.mediaResolver });
         if (attachmentTool) tools.push(attachmentTool);
@@ -1114,6 +1080,7 @@ export class GroupAgentCore {
         knowledgeAvailable: this.#knowledgeRetriever !== undefined,
         ...(preverifiedKnowledge ? { preverifiedKnowledge } : {}),
         emojiAvailable: tools.some((tool) => tool.name === "send_emoji"),
+        imageUnderstandingAvailable,
         recentReplyStyle: recentReplyStyleFingerprint(recentMessages),
         ...(voiceReplyMode ? { voiceReplyMode } : {}),
       });
@@ -1258,11 +1225,12 @@ export class GroupAgentCore {
     );
     const action = result.actions[0];
     if (action) {
+      const historyText = text || renderMessageParts(parts, true).join("\n");
       this.#sharedConversationState?.appendOutbound(
         event,
         activeBot,
         action.id,
-        text,
+        historyText,
         action.createdAt,
       );
     }
@@ -1841,7 +1809,10 @@ function participationJudgeSystemPrompt(intensity: ParticipationIntensity): stri
     : intensity === "active"
       ? "当前为积极档：除了明确追问和纠正，自然延续机器人刚参与的话题、合适的轻松接梗、或能提供实际帮助时也可 speak；但不要打断群友之间的私聊，不要只做无信息量附和。"
       : "当前为标准档：追问、纠正机器人或机器人确实能补充有用新信息时 speak；不确定时 silent。";
-  return `你是群聊接话门控分类器，不负责回答问题。${policy} 只有笑声、感谢、收到、纯附和，群友之间互相对话，明显话题转移，以及机器人只能重复或礼貌应和时选择 silent。confidence 表示分类正确性的把握，不表示接话意愿。只输出一行 JSON，不输出解释、Markdown、代码围栏或工具调用。`;
+  return `你是群聊接话门控分类器，不负责回答问题。${policy} 只有笑声、感谢、收到、纯附和，群友之间互相对话，明显话题转移，以及机器人只能重复或礼貌应和时选择 silent。confidence 表示分类正确性的把握，不表示接话意愿。
+
+固定规则：speak 只能搭配 followup、correction 或 new_info；silent 只能搭配 ack_only、human_to_human、topic_shift、no_value 或 uncertain。不确定当前消息是不是在对机器人说时选择 silent/uncertain；不要因为关键词相似就认定同一话题，要结合说话人和语义关系。
+参考：机器人回答后群友追问属于 followup；群友指出机器人信息有误属于 correction；群友只说“好的谢谢”属于 ack_only；群友改聊晚饭属于 topic_shift。只输出一行 JSON，不输出解释、Markdown、代码围栏或工具调用。`;
 }
 
 function parseConversationJudge(value: string | null): {

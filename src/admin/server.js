@@ -9,14 +9,20 @@ import { testModelConnection } from "./model-runtime.js";
 import { probeKnowledgeProvider } from "../knowledge-retriever.js";
 import { probeMcpServer } from "../mcp.js";
 import { BUILT_IN_PLUGIN_DEFINITIONS, withImplicitBuiltInPlugins } from "../plugins/catalog.js";
+import { compressForChat } from "../plugins/meme-generator.js";
+import { customMemeInfo, getCustomMeme, listCustomMemes, saveCustomMeme } from "../meme-custom.js";
 import { AgentSupervisor } from "./supervisor.js";
-import { WechatIpadLoginManager } from "./wechat-ipad-login.js";
 import { AISTUDIO_TTS_VOICES, DEFAULT_TTS_STYLE, DEFAULT_TTS_VOICE, TTS_VOICE_PRESETS, } from "../voice-style.js";
-import { createWechatAdapterRegistry } from "../adapters/definitions.js";
+import { ChannelAdapterRegistry } from "../channel-adapter.js";
 // Persona avatar presets are stored as data URLs; keep this below the hard 10 MiB constructor bound.
 const DEFAULT_MAX_BODY_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MEME_API_BASE_URL = "http://127.0.0.1:2233";
+const MEME_REQUEST_MAX_BYTES = 32 * 1024 * 1024;
+const MEME_INPUT_MAX_BYTES = 20 * 1024 * 1024;
+const MEME_RESPONSE_MAX_BYTES = 64 * 1024 * 1024;
+const MEME_SEND_MAX_BYTES = 8 * 1024 * 1024;
+const MEME_TIMEOUT_MS = 60_000;
 const DEFAULT_WEB_ROOT = fileURLToPath(new URL("../../webui/", import.meta.url));
-const CHANNEL_ADAPTERS = createWechatAdapterRegistry();
 const BUILT_IN_PLUGINS = Object.freeze(BUILT_IN_PLUGIN_DEFINITIONS.map((plugin) => ({
     type: plugin.type,
     name: plugin.label,
@@ -31,7 +37,7 @@ export class AdminServer {
     #allowPublicClients;
     #maxBodyBytes;
     #webRoot;
-    #ipadLoginManager;
+    #adapterRegistry;
     #server;
     constructor(options) {
         if (options.token.length < 24)
@@ -44,7 +50,7 @@ export class AdminServer {
         this.#allowPublicClients = options.allowPublicClients ?? false;
         this.#maxBodyBytes = boundedInteger(options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES, 1024, 10 * 1024 * 1024, "maxBodyBytes");
         this.#webRoot = options.webRoot ?? DEFAULT_WEB_ROOT;
-        this.#ipadLoginManager = options.ipadLoginManager;
+        this.#adapterRegistry = options.adapterRegistry ?? new ChannelAdapterRegistry();
     }
     async start() {
         if (this.#server)
@@ -90,14 +96,6 @@ export class AdminServer {
         if (!this.#allowPublicClients && !isPrivateClient(request.socket.remoteAddress)) {
             throw new HttpError(403, "private_network_required", "WebUI only accepts private-network clients");
         }
-        if (url.pathname.startsWith("/ipad-login/slider/")) {
-            await this.#handlePublicSlider(request, response, url);
-            return;
-        }
-        if (url.pathname.startsWith("/ipad-login/slider-submit/")) {
-            await this.#handlePublicSliderSubmit(request, response, url);
-            return;
-        }
         if (!url.pathname.startsWith("/api/")) {
             await this.#serveStatic(url.pathname, response);
             return;
@@ -115,8 +113,8 @@ export class AdminServer {
         if (method === "GET" && url.pathname === "/api/v1/console-manifest") {
             replyJson(response, 200, {
                 apiVersion: 1,
-                modules: ["core", "wechat"],
-                adapters: CHANNEL_ADAPTERS.list(),
+                modules: ["core", "adapters"],
+                adapters: this.#adapterRegistry.list(),
             });
             return;
         }
@@ -147,10 +145,10 @@ export class AdminServer {
             const status = this.#supervisor.status();
             const statusByBotId = new Map(status.bots.map((bot) => [bot.id, bot]));
             replyJson(response, 200, {
-                manifests: CHANNEL_ADAPTERS.list(),
+                manifests: this.#adapterRegistry.list(),
                 instances: this.#store.listBots().map((bot) => {
                     const runtime = statusByBotId.get(bot.id);
-                    const manifest = CHANNEL_ADAPTERS.manifest(bot.channel.type);
+                    const manifest = this.#adapterRegistry.manifest(bot.channel.type);
                     return {
                         id: bot.id,
                         botId: bot.id,
@@ -168,6 +166,133 @@ export class AdminServer {
                     };
                 }),
             });
+            return;
+        }
+        if (method === "GET" && url.pathname === "/api/meme-generator/memes") {
+            const customMemes = await listCustomMemes();
+            let payload = [];
+            try {
+                payload = await fetchMemeJson("memes/keys");
+            }
+            catch (error) {
+                if (customMemes.length === 0)
+                    throw error;
+            }
+            if (!Array.isArray(payload) || payload.some((item) => typeof item !== "string")) {
+                throw new HttpError(502, "meme_service_invalid_response", "Meme service returned an invalid key list");
+            }
+            replyJson(response, 200, {
+                keys: [...new Set([...customMemes.map((meme) => meme.key), ...payload.map((item) => item.trim()).filter(Boolean)])],
+            });
+            return;
+        }
+        const memeInfoMatch = /^\/api\/meme-generator\/memes\/([a-zA-Z0-9_-]{1,64})\/info$/.exec(url.pathname);
+        if (method === "GET" && memeInfoMatch) {
+            const key = memeInfoMatch[1];
+            const custom = (await listCustomMemes()).find((meme) => meme.key === key);
+            if (custom) {
+                replyJson(response, 200, customMemeInfo(custom));
+                return;
+            }
+            const payload = await fetchMemeJson(`memes/${encodeURIComponent(key)}/info`);
+            replyJson(response, 200, normalizeMemeInfo(key, payload));
+            return;
+        }
+        if (method === "POST" && url.pathname === "/api/meme-generator/custom") {
+            const body = inputRecord(await readJson(request, Math.max(this.#maxBodyBytes, MEME_REQUEST_MAX_BYTES)));
+            const key = requiredMemeKey(body.key);
+            const [image] = memeInputImages([{ dataUrl: body.dataUrl }]);
+            if (!image)
+                throw new HttpError(400, "invalid_custom_meme", "Custom meme image is required");
+            try {
+                const saved = await saveCustomMeme({
+                    key,
+                    bytes: image.bytes,
+                    mimeType: image.mimeType,
+                    ...(optionalBodyText(body, "title", 120) ? { title: optionalBodyText(body, "title", 120) } : {}),
+                    keywords: memeKeywords(body.keywords),
+                });
+                replyJson(response, 201, { meme: { ...saved, ...customMemeInfo(saved) } });
+            }
+            catch (error) {
+                throw new HttpError(400, "custom_meme_save_failed", error instanceof Error ? error.message : String(error));
+            }
+            return;
+        }
+        if (method === "POST" && url.pathname === "/api/meme-generator/generate") {
+            const body = inputRecord(await readJson(request, Math.max(this.#maxBodyBytes, MEME_REQUEST_MAX_BYTES)));
+            const key = requiredMemeKey(body.key);
+            const images = memeInputImages(body.images);
+            const texts = memeTexts(body.texts);
+            const args = body.args === undefined ? {} : inputRecord(body.args);
+            const custom = await getCustomMeme(key);
+            if (custom) {
+                if (images.length > 0 || texts.length > 0 || Object.keys(args).length > 0) {
+                    throw new HttpError(400, "custom_meme_no_inputs", "Uploaded custom meme images do not accept extra input images, text, or arguments");
+                }
+                const compressed = await compressMemeForChat(custom.bytes, custom.mimeType);
+                replyJson(response, 200, {
+                    mimeType: compressed.mimeType,
+                    size: compressed.bytes.byteLength,
+                    data: Buffer.from(compressed.bytes).toString("base64"),
+                });
+                return;
+            }
+            const info = normalizeMemeInfo(key, await fetchMemeJson(`memes/${encodeURIComponent(key)}/info`));
+            if (images.length < info.minImages || images.length > info.maxImages) {
+                throw new HttpError(400, "meme_invalid_image_count", `“${memeDisplayName(info)}”需要 ${memeRangeText(info.minImages, info.maxImages)} 张图片，当前提供 ${images.length} 张`);
+            }
+            const effectiveTexts = texts.length === 0 ? info.defaultTexts : texts;
+            if (effectiveTexts.length < info.minTexts || effectiveTexts.length > info.maxTexts) {
+                throw new HttpError(400, "meme_invalid_text_count", `“${memeDisplayName(info)}”需要 ${memeRangeText(info.minTexts, info.maxTexts)} 段文字，当前提供 ${effectiveTexts.length} 段`);
+            }
+            const form = new FormData();
+            images.forEach((image, index) => {
+                form.append("images", new Blob([image.bytes], { type: image.mimeType }), `input-${index + 1}.${memeExtension(image.mimeType)}`);
+            });
+            effectiveTexts.forEach((text) => form.append("texts", text));
+            form.append("args", JSON.stringify(args));
+            const { response: upstream, bytes } = await fetchMemeResponse(`memes/${encodeURIComponent(key)}/`, {
+                method: "POST",
+                body: form,
+            });
+            if (!upstream.ok) throw memeUpstreamError(upstream.status, bytes);
+            const mimeType = sniffMemeMimeType(bytes) ?? upstream.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+            if (!mimeType?.startsWith("image/")) {
+                throw new HttpError(502, "meme_service_invalid_response", "Meme service did not return an image");
+            }
+            const compressed = await compressMemeForChat(bytes, mimeType);
+            replyJson(response, 200, {
+                mimeType: compressed.mimeType,
+                size: compressed.bytes.byteLength,
+                data: Buffer.from(compressed.bytes).toString("base64"),
+            });
+            return;
+        }
+        if (method === "POST" && url.pathname === "/api/meme-generator/save") {
+            const body = inputRecord(await readJson(request, Math.max(this.#maxBodyBytes, MEME_REQUEST_MAX_BYTES)));
+            const botId = requiredBodyText(body, "botId", 200);
+            const key = requiredMemeKey(body.key);
+            const [image] = memeInputImages([{ dataUrl: body.dataUrl }]);
+            if (!image)
+                throw new HttpError(400, "invalid_meme_image", "Generated meme image is required");
+            const description = optionalBodyText(body, "description", 500) ?? `Meme ${key}`;
+            const compressed = await compressMemeForChat(image.bytes, image.mimeType);
+            try {
+                const saved = await this.#supervisor.saveGeneratedEmoji(botId, {
+                    data: compressed.bytes,
+                    mimeType: compressed.mimeType,
+                    name: `meme-${key}.${memeExtension(compressed.mimeType)}`,
+                    description,
+                    memeKey: key,
+                });
+                const { asset, ...emoji } = saved;
+                replyJson(response, 200, { emoji: { ...emoji, mimeType: asset.mimeType, size: asset.size } });
+            }
+            catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                throw new HttpError(/does not exist/u.test(message) ? 404 : 400, "meme_save_failed", message);
+            }
             return;
         }
         if (method === "GET" && url.pathname === "/api/emojis") {
@@ -528,12 +653,12 @@ export class AdminServer {
             const body = inputRecord(await readJson(request, this.#maxBodyBytes));
             const botId = requiredBodyText(body, "botId", 64);
             const conversationId = optionalBodyText(body, "conversationId", 300);
-            const result = await this.#wechat(() => this.#supervisor.applyPersonaIdentity(botId, personaId, {
+            const result = await this.#supervisor.applyChannelIdentity(botId, personaId, {
                 force: true,
                 ...(conversationId ? { conversationId } : {}),
-            }));
-            this.#log("info", "wechat.persona_applied", `人设 ${personaId} 已手动应用到微信账号`, botId);
-            replyJson(response, 200, { result, capabilities: this.#supervisor.wechatCapabilities(botId) });
+            });
+            this.#log("info", "channel.persona_applied", `人设 ${personaId} 已手动应用到通道`, botId);
+            replyJson(response, 200, { result, capabilities: this.#supervisor.channelCapabilities(botId) });
             return;
         }
         if (method === "POST" && url.pathname === "/api/models/test") {
@@ -602,247 +727,6 @@ export class AdminServer {
         if (method === "GET" && url.pathname === "/api/bots") {
             replyJson(response, 200, { bots: this.#store.listBots(), status: this.#supervisor.status().bots });
             return;
-        }
-        const wechatCapabilityMatch = /^\/api\/bots\/([a-zA-Z0-9._-]+)\/wechat\/capabilities$/.exec(url.pathname);
-        if (method === "GET" && wechatCapabilityMatch) {
-            replyJson(response, 200, { capabilities: this.#supervisor.wechatCapabilities(wechatCapabilityMatch[1]) });
-            return;
-        }
-        const wechatProfileMatch = /^\/api\/bots\/([a-zA-Z0-9._-]+)\/wechat\/(profile|avatar|qrcode)$/.exec(url.pathname);
-        if (wechatProfileMatch) {
-            const botId = wechatProfileMatch[1];
-            const action = wechatProfileMatch[2];
-            const client = await this.#wechat(() => Promise.resolve(this.#supervisor.wechatClient(botId)));
-            if (method === "GET" && action === "profile") {
-                replyJson(response, 200, { profile: await this.#wechat(() => client.getAccountProfile()) });
-                return;
-            }
-            if (method === "PATCH" && action === "profile") {
-                const body = inputRecord(await readJson(request, this.#maxBodyBytes));
-                const sexValue = body.sex;
-                if (sexValue !== undefined && sexValue !== 0 && sexValue !== 1 && sexValue !== 2) {
-                    throw new HttpError(400, "invalid_profile", "sex must be 0, 1 or 2");
-                }
-                const result = await this.#wechat(() => client.updateAccountProfile({
-                    ...(optionalBodyText(body, "nickname", 32) !== undefined ? { nickname: optionalBodyText(body, "nickname", 32) } : {}),
-                    ...(sexValue === undefined ? {} : { sex: sexValue }),
-                    ...(optionalBodyText(body, "country", 32) !== undefined ? { country: optionalBodyText(body, "country", 32) } : {}),
-                    ...(optionalBodyText(body, "province", 64) !== undefined ? { province: optionalBodyText(body, "province", 64) } : {}),
-                    ...(optionalBodyText(body, "city", 64) !== undefined ? { city: optionalBodyText(body, "city", 64) } : {}),
-                    ...(optionalBodyText(body, "signature", 120) !== undefined ? { signature: optionalBodyText(body, "signature", 120) } : {}),
-                }));
-                this.#log("info", "wechat.profile_updated", "已从 WebUI 修改微信账号资料", botId);
-                replyJson(response, 200, { result });
-                return;
-            }
-            if (method === "POST" && action === "avatar") {
-                const body = inputRecord(await readJson(request, this.#maxBodyBytes));
-                const avatar = requiredImageDataUrl(body.avatarDataUrl);
-                const result = await this.#wechat(() => client.uploadHeadImage(avatar));
-                this.#log("info", "wechat.avatar_updated", "已从 WebUI 修改微信账号头像", botId);
-                replyJson(response, 200, { result });
-                return;
-            }
-            if (method === "GET" && action === "qrcode") {
-                replyJson(response, 200, { qrcode: await this.#wechat(() => client.getAccountQrCode()) });
-                return;
-            }
-            throw new HttpError(405, "method_not_allowed", "Unsupported WeChat profile operation");
-        }
-        const wechatGroupMatch = /^\/api\/bots\/([a-zA-Z0-9._-]+)\/wechat\/groups\/([^/]+)(?:\/(qrcode|members|admin))?$/.exec(url.pathname);
-        if (wechatGroupMatch) {
-            const botId = wechatGroupMatch[1];
-            const roomId = canonicalChatroomId(decodeURIComponent(wechatGroupMatch[2]));
-            const action = wechatGroupMatch[3];
-            const client = await this.#wechat(() => Promise.resolve(this.#supervisor.wechatClient(botId)));
-            if (method === "GET" && !action) {
-                replyJson(response, 200, {
-                    roomId,
-                    details: await this.#wechat(() => client.getGroupDetails(roomId)),
-                    members: await this.#wechat(() => client.listGroupMembers(roomId)),
-                    capabilities: this.#supervisor.wechatCapabilities(botId),
-                });
-                return;
-            }
-            if (method === "GET" && action === "qrcode") {
-                replyJson(response, 200, { roomId, qrcode: await this.#wechat(() => client.getGroupQrCode(roomId)) });
-                return;
-            }
-            if (method === "PATCH" && !action) {
-                const body = inputRecord(await readJson(request, this.#maxBodyBytes));
-                const operation = requiredBodyText(body, "operation", 32);
-                let result;
-                if (operation === "remarks")
-                    result = await this.#wechat(() => client.setGroupRemarks(roomId, bodyText(body, "value", 64, true)));
-                else if (operation === "name")
-                    result = await this.#wechat(() => client.setGroupName(roomId, requiredBodyText(body, "value", 64)));
-                else if (operation === "announcement")
-                    result = await this.#wechat(() => client.setGroupAnnouncement(roomId, bodyText(body, "value", 2_000, true)));
-                else if (operation === "saveToContacts") {
-                    if (typeof body.enabled !== "boolean")
-                        throw new HttpError(400, "invalid_group_operation", "enabled must be a boolean");
-                    result = await this.#wechat(() => client.saveGroupToContacts(roomId, body.enabled));
-                }
-                else
-                    throw new HttpError(400, "invalid_group_operation", "Unsupported group operation");
-                this.#log("info", `wechat.group_${operation}`, `已从 WebUI 执行群设置：${operation}`, botId);
-                replyJson(response, 200, { roomId, result });
-                return;
-            }
-            if (method === "POST" && action === "members") {
-                const body = inputRecord(await readJson(request, this.#maxBodyBytes));
-                const memberAction = requiredBodyText(body, "action", 16);
-                if (memberAction !== "add" && memberAction !== "invite" && memberAction !== "remove") {
-                    throw new HttpError(400, "invalid_group_member_action", "action must be add, invite or remove");
-                }
-                const memberIds = bodyStringArray(body, "memberIds", 100);
-                const result = await this.#wechat(() => client.manageGroupMembers(roomId, memberAction, memberIds));
-                this.#log("warn", `wechat.group_members_${memberAction}`, `已从 WebUI 执行群成员操作：${memberAction}`, botId);
-                replyJson(response, 200, { roomId, result });
-                return;
-            }
-            if (method === "POST" && action === "admin") {
-                const body = inputRecord(await readJson(request, this.#maxBodyBytes));
-                const adminAction = requiredBodyText(body, "action", 16);
-                if (adminAction !== "add" && adminAction !== "remove" && adminAction !== "transfer") {
-                    throw new HttpError(400, "invalid_group_admin_action", "action must be add, remove or transfer");
-                }
-                const memberIds = bodyStringArray(body, "memberIds", adminAction === "transfer" ? 1 : 10);
-                const result = await this.#wechat(() => client.operateGroupAdmin(roomId, adminAction, memberIds));
-                this.#log("warn", `wechat.group_admin_${adminAction}`, `已从 WebUI 执行群管理员操作：${adminAction}`, botId);
-                replyJson(response, 200, { roomId, result });
-                return;
-            }
-            throw new HttpError(405, "method_not_allowed", "Unsupported WeChat group operation");
-        }
-        const wechatContactsMatch = /^\/api\/bots\/([a-zA-Z0-9._-]+)\/wechat\/contacts(?:\/(search|details|remark|friend-state|approve))?$/.exec(url.pathname);
-        if (wechatContactsMatch) {
-            const botId = wechatContactsMatch[1];
-            const action = wechatContactsMatch[2];
-            const client = await this.#wechat(() => Promise.resolve(this.#supervisor.wechatClient(botId)));
-            if (method === "GET" && !action) {
-                replyJson(response, 200, { contacts: await this.#wechat(() => client.listContacts()) });
-                return;
-            }
-            const body = inputRecord(await readJson(request, this.#maxBodyBytes));
-            if (method === "POST" && action === "search") {
-                replyJson(response, 200, { contact: await this.#wechat(() => client.searchContact(requiredBodyText(body, "query", 64))) });
-                return;
-            }
-            if (method === "POST" && action === "details") {
-                replyJson(response, 200, { contacts: await this.#wechat(() => client.getContactDetails(bodyStringArray(body, "contactIds", 100))) });
-                return;
-            }
-            if (method === "POST" && action === "friend-state") {
-                replyJson(response, 200, { state: await this.#wechat(() => client.getFriendState(requiredBodyText(body, "contactId", 300))) });
-                return;
-            }
-            if (method === "POST" && action === "remark") {
-                const result = await this.#wechat(() => client.setContactRemark(requiredBodyText(body, "contactId", 300), bodyText(body, "remarks", 64, true)));
-                this.#log("info", "wechat.contact_remark_updated", "已从 WebUI 修改联系人备注", botId);
-                replyJson(response, 200, { result });
-                return;
-            }
-            if (method === "POST" && action === "approve") {
-                const scene = body.scene;
-                if (!Number.isSafeInteger(scene) || scene < 0)
-                    throw new HttpError(400, "invalid_friend_request", "scene is invalid");
-                const result = await this.#wechat(() => client.approveFriendRequest(scene, requiredBodyText(body, "v1", 2_000), requiredBodyText(body, "v2", 2_000)));
-                this.#log("info", "wechat.friend_request_approved", "已从 WebUI 通过好友请求", botId);
-                replyJson(response, 200, { result });
-                return;
-            }
-            throw new HttpError(405, "method_not_allowed", "Unsupported contact operation");
-        }
-        const wechatLabelsMatch = /^\/api\/bots\/([a-zA-Z0-9._-]+)\/wechat\/labels(?:\/([^/]+))?$/.exec(url.pathname);
-        if (wechatLabelsMatch) {
-            const botId = wechatLabelsMatch[1];
-            const labelId = wechatLabelsMatch[2] ? decodeURIComponent(wechatLabelsMatch[2]) : undefined;
-            const client = await this.#wechat(() => Promise.resolve(this.#supervisor.wechatClient(botId)));
-            if (method === "GET" && !labelId) {
-                replyJson(response, 200, { labels: await this.#wechat(() => client.listLabels()) });
-                return;
-            }
-            const body = method === "DELETE" ? {} : inputRecord(await readJson(request, this.#maxBodyBytes));
-            let result;
-            if (method === "POST" && !labelId)
-                result = await this.#wechat(() => client.addLabel(requiredBodyText(body, "name", 32)));
-            else if (method === "PATCH" && labelId && body.name !== undefined)
-                result = await this.#wechat(() => client.renameLabel(labelId, requiredBodyText(body, "name", 32)));
-            else if (method === "PATCH" && labelId)
-                result = await this.#wechat(() => client.updateLabelMembers(labelId, bodyStringArray(body, "contactIds", 500)));
-            else if (method === "DELETE" && labelId)
-                result = await this.#wechat(() => client.deleteLabel(labelId));
-            else
-                throw new HttpError(405, "method_not_allowed", "Unsupported label operation");
-            this.#log(method === "DELETE" ? "warn" : "info", `wechat.label_${method.toLowerCase()}`, "已从 WebUI 修改联系人标签", botId);
-            replyJson(response, 200, { result });
-            return;
-        }
-        const wechatMomentAutomationMatch = /^\/api\/bots\/([a-zA-Z0-9._-]+)\/wechat\/moments\/automation$/.exec(url.pathname);
-        if (wechatMomentAutomationMatch) {
-            const botId = wechatMomentAutomationMatch[1];
-            const bot = this.#store.getBot(botId);
-            if (!bot)
-                throw new HttpError(404, "not_found", "Bot not found");
-            if (bot.channel.type !== "wechat-ipad")
-                throw new HttpError(400, "invalid_channel", "Moment automation requires an iPad bot");
-            if (method === "GET") {
-                replyJson(response, 200, {
-                    settings: this.#store.getWechatMomentAutomation(botId),
-                    actions: this.#store.listWechatMomentActions(botId, 100),
-                });
-                return;
-            }
-            if (method === "PUT") {
-                const body = await readJson(request, this.#maxBodyBytes);
-                let settings;
-                try {
-                    settings = this.#store.saveWechatMomentAutomation(botId, body);
-                }
-                catch (error) {
-                    throw new HttpError(400, "invalid_moment_automation", error instanceof Error ? error.message : String(error));
-                }
-                this.#log(settings.enabled && !settings.dryRun ? "warn" : "info", "wechat.moment_automation_saved", `朋友圈自动互动策略已${settings.enabled ? "启用" : "停用"}`, botId);
-                replyJson(response, 200, { settings, actions: this.#store.listWechatMomentActions(botId, 100) });
-                return;
-            }
-            throw new HttpError(405, "method_not_allowed", "Unsupported moment automation operation");
-        }
-        const wechatMomentsMatch = /^\/api\/bots\/([a-zA-Z0-9._-]+)\/wechat\/moments(?:\/([^/]+)\/(like|comment))?$/.exec(url.pathname);
-        if (wechatMomentsMatch) {
-            const botId = wechatMomentsMatch[1];
-            const momentId = wechatMomentsMatch[2] ? decodeURIComponent(wechatMomentsMatch[2]) : undefined;
-            const action = wechatMomentsMatch[3];
-            const client = await this.#wechat(() => Promise.resolve(this.#supervisor.wechatClient(botId)));
-            if (method === "GET" && !momentId) {
-                replyJson(response, 200, { moments: await this.#wechat(() => client.listMoments()) });
-                return;
-            }
-            if (method === "POST" && !momentId) {
-                const body = inputRecord(await readJson(request, this.#maxBodyBytes));
-                const privacy = body.privacy === "private" ? "private" : body.privacy === "public" || body.privacy === undefined ? "public" : undefined;
-                if (!privacy)
-                    throw new HttpError(400, "invalid_moment", "privacy must be public or private");
-                const result = await this.#wechat(() => client.publishTextMoment(requiredBodyText(body, "content", 2_000), privacy));
-                this.#log("warn", "wechat.moment_published", "已从 WebUI 手动发布朋友圈", botId);
-                replyJson(response, 200, { result });
-                return;
-            }
-            if (method === "POST" && momentId && action === "like") {
-                const result = await this.#wechat(() => client.likeMoment(momentId));
-                this.#log("info", "wechat.moment_liked", "已从 WebUI 点赞朋友圈", botId);
-                replyJson(response, 200, { result });
-                return;
-            }
-            if (method === "POST" && momentId && action === "comment") {
-                const body = inputRecord(await readJson(request, this.#maxBodyBytes));
-                const result = await this.#wechat(() => client.commentMoment(momentId, requiredBodyText(body, "content", 500)));
-                this.#log("info", "wechat.moment_commented", "已从 WebUI 评论朋友圈", botId);
-                replyJson(response, 200, { result });
-                return;
-            }
-            throw new HttpError(405, "method_not_allowed", "Unsupported moment operation");
         }
         if (method === "GET" && url.pathname === "/api/chatrooms") {
             replyJson(response, 200, { chatrooms: await this.#supervisor.listChatrooms() });
@@ -981,7 +865,7 @@ export class AdminServer {
                 bots: this.#store.listBots().map((bot) => ({
                     id: bot.id,
                     displayName: bot.displayName,
-                    plugins: bot.plugins,
+                    plugins: withImplicitBuiltInPlugins(bot.plugins),
                 })),
             });
             return;
@@ -1201,11 +1085,11 @@ export class AdminServer {
                 if (persona?.autoApplyAccountProfile) {
                     for (const target of body.targets) {
                         try {
-                            await this.#supervisor.applyPersonaIdentity(target.botId, persona.id, { conversationId: target.chatroomId });
+                            await this.#supervisor.applyChannelIdentity(target.botId, persona.id, { conversationId: target.chatroomId });
                             identitySyncs += 1;
                         }
                         catch (error) {
-                            this.#log("warn", "wechat.persona_identity_apply_failed", error instanceof Error ? error.message : String(error), target.botId);
+                            this.#log("warn", "channel.persona_identity_apply_failed", error instanceof Error ? error.message : String(error), target.botId);
                         }
                     }
                 }
@@ -1286,10 +1170,10 @@ export class AdminServer {
             const selectedPersona = selectedPersonaId ? this.#store.getPersonaProfile(selectedPersonaId) : undefined;
             if (personaChanged && selectedPersona?.autoApplyAccountProfile) {
                 try {
-                    identitySync = await this.#supervisor.applyPersonaIdentity(id, selectedPersona.id, { conversationId: canonicalId });
+                    identitySync = await this.#supervisor.applyChannelIdentity(id, selectedPersona.id, { conversationId: canonicalId });
                 }
                 catch (error) {
-                    this.#log("warn", "wechat.persona_identity_apply_failed", error instanceof Error ? error.message : String(error), id);
+                    this.#log("warn", "channel.persona_identity_apply_failed", error instanceof Error ? error.message : String(error), id);
                 }
             }
             replyJson(response, 200, {
@@ -1300,61 +1184,10 @@ export class AdminServer {
             });
             return;
         }
-        const ipadLoginMatch = /^\/api\/bots\/([a-zA-Z0-9._-]+)\/login(?:\/(qr|poll|security-code|slider|session))?$/.exec(url.pathname);
-        if (ipadLoginMatch) {
-            const manager = this.#ipadLoginManager;
-            if (!manager)
-                throw new HttpError(503, "ipad_login_unavailable", "wechat-ipad login management is unavailable");
-            const id = ipadLoginMatch[1];
-            const action = ipadLoginMatch[2];
-            try {
-                if (method === "GET" && !action) {
-                    replyJson(response, 200, { login: await manager.status(id) });
-                    return;
-                }
-                if (method === "POST" && action === "qr") {
-                    const body = await readJson(request, this.#maxBodyBytes);
-                    const object = inputRecord(body);
-                    const loginType = typeof object.loginType === "string" ? object.loginType : undefined;
-                    const deviceName = typeof object.deviceName === "string" ? object.deviceName : undefined;
-                    replyJson(response, 200, {
-                        login: await manager.start(id, {
-                            ...(loginType ? { loginType: loginType } : {}),
-                            ...(deviceName ? { deviceName } : {}),
-                        }),
-                    });
-                    return;
-                }
-                if (method === "POST" && action === "poll") {
-                    replyJson(response, 200, { login: await manager.poll(id) });
-                    return;
-                }
-                if (method === "POST" && action === "security-code") {
-                    const body = inputRecord(await readJson(request, this.#maxBodyBytes));
-                    if (typeof body.code !== "string")
-                        throw new Error("请输入六位安全码");
-                    replyJson(response, 200, { login: await manager.submitSecurityCode(id, body.code) });
-                    return;
-                }
-                if (method === "POST" && action === "slider") {
-                    replyJson(response, 200, { url: manager.createSliderUrl(id) });
-                    return;
-                }
-                if (method === "DELETE" && action === "session") {
-                    replyJson(response, 200, { login: manager.cancel(id) });
-                    return;
-                }
-            }
-            catch (error) {
-                throw new HttpError(422, "ipad_login_failed", error instanceof Error ? error.message : String(error));
-            }
-            throw new HttpError(405, "method_not_allowed", "Unsupported login operation");
-        }
         if (method === "POST" && url.pathname === "/api/bots") {
             const body = await readJson(request, this.#maxBodyBytes);
             const bot = parseInput(() => parseBotConfig(body));
             this.#assertBotReferences(bot);
-            this.#assertUniqueWebhook(bot);
             this.#store.saveBot(bot);
             const affectedBotIds = [bot.id, ...this.#supervisor.synchronizeAgentConfiguration(bot.id)];
             this.#log("info", "config.bot_saved", `机器人配置 ${bot.id} 已保存`, bot.id);
@@ -1499,52 +1332,10 @@ export class AdminServer {
             }
         }
     }
-    async #handlePublicSlider(request, response, url) {
-        if (request.method !== "GET")
-            throw new HttpError(405, "method_not_allowed", "Only GET is allowed");
-        const nonce = url.pathname.slice("/ipad-login/slider/".length);
-        try {
-            const html = await this.#ipadLoginManager?.sliderPage(nonce);
-            if (!html)
-                throw new Error("滑块登录服务不可用");
-            replySliderHtml(response, html);
-        }
-        catch {
-            throw new HttpError(404, "slider_session_invalid", "滑块验证会话无效或已过期");
-        }
-    }
-    async #handlePublicSliderSubmit(request, response, url) {
-        if (request.method !== "GET")
-            throw new HttpError(405, "method_not_allowed", "Only GET is allowed");
-        const nonce = url.pathname.slice("/ipad-login/slider-submit/".length);
-        try {
-            const result = await this.#ipadLoginManager?.submitSlider(nonce, url.searchParams);
-            if (result === undefined)
-                throw new Error("滑块登录服务不可用");
-            replyJson(response, 200, result);
-        }
-        catch {
-            throw new HttpError(422, "slider_submit_failed", "滑块验证提交失败，请关闭页面后重试");
-        }
-    }
     #assertModelReference(model) {
         const providerProfile = this.#store.getProviderProfile(model.providerProfileId);
         if (!providerProfile) {
             throw new HttpError(400, "missing_provider", `Provider profile ${model.providerProfileId} does not exist`);
-        }
-    }
-    async #wechat(operation) {
-        try {
-            return await operation();
-        }
-        catch (error) {
-            if (error instanceof HttpError)
-                throw error;
-            const message = error instanceof Error ? error.message : String(error);
-            if (/用户可能退出|账号可能退出/u.test(message.normalize("NFKC"))) {
-                throw new HttpError(422, "wechat_operation_temporarily_rejected", "iPad 管理接口暂时拒绝了此操作，但账号仍在线；请稍后重试或改用另一个 Bot。");
-            }
-            throw new HttpError(422, "wechat_operation_failed", message);
         }
     }
     #providerApiKey(profile, input) {
@@ -1576,20 +1367,6 @@ export class AdminServer {
         }
         return apiKey;
     }
-    #assertUniqueWebhook(bot) {
-        const port = bot.channel.type === "wx-hook-http" ? bot.channel.webhookPort : bot.channel.callbackPort;
-        const conflict = this.#store
-            .listBots()
-            .find((candidate) => {
-            const candidatePort = candidate.channel.type === "wx-hook-http"
-                ? candidate.channel.webhookPort
-                : candidate.channel.callbackPort;
-            return candidate.id !== bot.id && candidatePort === port;
-        });
-        if (conflict) {
-            throw new HttpError(409, "webhook_port_conflict", `Webhook port is already used by bot ${conflict.id}`);
-        }
-    }
     #authenticate(request) {
         const authorization = request.headers.authorization;
         if (!authorization?.startsWith("Bearer "))
@@ -1610,7 +1387,7 @@ export class AdminServer {
     }
     async #serveStatic(pathname, response) {
         const file = pathname === "/" ? "index.html" : decodeURIComponent(pathname).replace(/^\/+/u, "");
-        if (!/^(?:index\.html|pi-bot\.svg|assets\/[a-zA-Z0-9._-]+|legacy\/(?:index\.html|app\.js|styles\.css))$/u.test(file))
+        if (!/^(?:index\.html|pi-bot\.svg|assets\/[a-zA-Z0-9._-]+)$/u.test(file))
             throw new HttpError(404, "not_found", "Page not found");
         let body;
         try {
@@ -1664,6 +1441,179 @@ class HttpError extends Error {
         this.code = code;
         this.details = details;
     }
+}
+function memeApiBaseUrl() {
+    const value = process.env.PI_MEME_API_BASE_URL?.trim() || DEFAULT_MEME_API_BASE_URL;
+    let url;
+    try {
+        url = new URL(value);
+    }
+    catch {
+        throw new HttpError(500, "meme_service_config_invalid", "PI_MEME_API_BASE_URL is invalid");
+    }
+    if (!(url.protocol === "http:" || url.protocol === "https:") || url.username || url.password || url.search || url.hash) {
+        throw new HttpError(500, "meme_service_config_invalid", "PI_MEME_API_BASE_URL must be a credential-free HTTP(S) URL");
+    }
+    if (!url.pathname.endsWith("/"))
+        url.pathname += "/";
+    return url;
+}
+function memeApiUrl(path) {
+    return new URL(path.replace(/^\/+/, ""), memeApiBaseUrl());
+}
+async function fetchMemeJson(path) {
+    const { response, bytes } = await fetchMemeResponse(path);
+    if (!response.ok)
+        throw memeUpstreamError(response.status, bytes);
+    try {
+        return JSON.parse(Buffer.from(bytes).toString("utf8"));
+    }
+    catch {
+        throw new HttpError(502, "meme_service_invalid_response", "Meme service returned invalid JSON");
+    }
+}
+async function compressMemeForChat(bytes, mimeType) {
+    try {
+        return await compressForChat(bytes, mimeType, MEME_SEND_MAX_BYTES);
+    }
+    catch (error) {
+        throw new HttpError(422, "meme_compression_failed", error instanceof Error ? error.message : String(error));
+    }
+}
+async function fetchMemeResponse(path, init = {}) {
+    let response;
+    try {
+        response = await fetch(memeApiUrl(path), {
+            ...init,
+            signal: init.signal ?? AbortSignal.timeout(MEME_TIMEOUT_MS),
+        });
+    }
+    catch (error) {
+        throw new HttpError(502, "meme_service_unavailable", `Meme service is unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return { response, bytes: await readMemeResponse(response) };
+}
+async function readMemeResponse(response) {
+    const declared = Number(response.headers.get("content-length") ?? "0");
+    if (Number.isFinite(declared) && declared > MEME_RESPONSE_MAX_BYTES)
+        throw new HttpError(502, "meme_response_too_large", "Meme service response is too large");
+    if (!response.body) {
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        if (bytes.byteLength > MEME_RESPONSE_MAX_BYTES)
+            throw new HttpError(502, "meme_response_too_large", "Meme service response is too large");
+        return bytes;
+    }
+    const reader = response.body.getReader();
+    const chunks = [];
+    let size = 0;
+    try {
+        while (true) {
+            const next = await reader.read();
+            if (next.done)
+                break;
+            size += next.value.byteLength;
+            if (size > MEME_RESPONSE_MAX_BYTES)
+                throw new HttpError(502, "meme_response_too_large", "Meme service response is too large");
+            chunks.push(next.value);
+        }
+    }
+    finally {
+        reader.releaseLock();
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+    }
+    return bytes;
+}
+function memeUpstreamError(status, bytes) {
+    const detail = Buffer.from(bytes).toString("utf8").replace(/\s+/gu, " ").trim().slice(0, 240);
+    if (status === 404)
+        return new HttpError(400, "meme_not_found", "没有找到这个表情模板，请刷新菜单后选择可用名称");
+    if (status === 541)
+        return new HttpError(400, "meme_invalid_input", "表情模板的图片或文字数量不符合要求，请先查看模板详情");
+    return new HttpError(502, "meme_service_failed", detail ? `Meme service HTTP ${status}: ${detail}` : `Meme service HTTP ${status}`);
+}
+function normalizeMemeInfo(key, value) {
+    const object = isRecordValue(value) ? value : {};
+    const params = isRecordValue(object.params_type) ? object.params_type : {};
+    return {
+        key,
+        keywords: Array.isArray(object.keywords) ? object.keywords.filter((item) => typeof item === "string").slice(0, 32) : [],
+        defaultTexts: Array.isArray(params.default_texts) ? params.default_texts.filter((item) => typeof item === "string").slice(0, 12) : [],
+        minImages: memeInfoInteger(params.min_images),
+        maxImages: memeInfoInteger(params.max_images),
+        minTexts: memeInfoInteger(params.min_texts),
+        maxTexts: memeInfoInteger(params.max_texts),
+    };
+}
+function memeDisplayName(info) {
+    return info.keywords.find((keyword) => /[\u3400-\u9fff]/u.test(keyword)) || info.key;
+}
+function memeRangeText(min, max) {
+    return min === max ? String(min) : `${min} ~ ${max}`;
+}
+function memeInfoInteger(value) {
+    return Number.isSafeInteger(value) && value >= 0 && value <= 12 ? value : 0;
+}
+function requiredMemeKey(value) {
+    if (typeof value !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/u.test(value.trim()))
+        throw new HttpError(400, "invalid_meme_key", "Meme key is invalid");
+    return value.trim();
+}
+function memeInputImages(value) {
+    if (value === undefined)
+        return [];
+    if (!Array.isArray(value) || value.length > 12)
+        throw new HttpError(400, "invalid_meme_images", "At most 12 meme input images are allowed");
+    return value.map((item) => {
+        if (!isRecordValue(item) || typeof item.dataUrl !== "string")
+            throw new HttpError(400, "invalid_meme_images", "Each meme input must be an image data URL");
+        const match = /^data:(image\/(?:jpeg|jpg|png|gif|webp));base64,([a-zA-Z0-9+/=\r\n]+)$/u.exec(item.dataUrl);
+        if (!match)
+            throw new HttpError(400, "invalid_meme_images", "Only JPEG, PNG, GIF and WebP images are supported");
+        const mimeType = match[1] === "image/jpg" ? "image/jpeg" : match[1];
+        const bytes = Buffer.from(match[2].replace(/\s+/gu, ""), "base64");
+        if (bytes.byteLength < 16 || bytes.byteLength > MEME_INPUT_MAX_BYTES)
+            throw new HttpError(400, "invalid_meme_images", "Each meme input image must be between 16 bytes and 20 MiB");
+        return { bytes, mimeType };
+    });
+}
+function memeTexts(value) {
+    if (value === undefined)
+        return [];
+    if (!Array.isArray(value) || value.length > 12 || value.some((item) => typeof item !== "string" || item.length > 1_000))
+        throw new HttpError(400, "invalid_meme_texts", "Meme texts must contain at most 12 strings of 1000 characters");
+    return value.map((item) => item.normalize("NFKC").trim()).filter(Boolean);
+}
+function memeKeywords(value) {
+    if (value === undefined)
+        return [];
+    if (!Array.isArray(value) || value.length > 12 || value.some((item) => typeof item !== "string" || item.length > 40))
+        throw new HttpError(400, "invalid_custom_meme", "Custom meme keywords must contain at most 12 short strings");
+    return value.map((item) => item.normalize("NFKC").trim()).filter(Boolean);
+}
+function memeExtension(mimeType) {
+    return mimeType === "image/gif" ? "gif" : mimeType === "image/png" ? "png" : mimeType === "image/webp" ? "webp" : "jpg";
+}
+function sniffMemeMimeType(data) {
+    if (data.length >= 6) {
+        const header = Buffer.from(data.subarray(0, 6)).toString("ascii");
+        if (header === "GIF87a" || header === "GIF89a")
+            return "image/gif";
+    }
+    if (data.length >= 8 && Buffer.from(data.subarray(0, 8)).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])))
+        return "image/png";
+    if (data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff)
+        return "image/jpeg";
+    if (data.length >= 12 && Buffer.from(data.subarray(0, 4)).toString("ascii") === "RIFF" && Buffer.from(data.subarray(8, 12)).toString("ascii") === "WEBP")
+        return "image/webp";
+    return undefined;
+}
+function isRecordValue(value) {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 async function readJson(request, maxBytes) {
     const contentType = request.headers["content-type"]?.split(";", 1)[0]?.trim().toLowerCase();
@@ -1846,8 +1796,8 @@ function inputRecord(value) {
 }
 function canonicalChatroomId(value) {
     const normalized = value.normalize("NFKC").trim().toLocaleLowerCase().split(":").at(-1) || "";
-    if (!normalized.endsWith("@chatroom") || /\s|[\u0000-\u001f]/u.test(normalized)) {
-        throw new HttpError(400, "invalid_chatroom", "chatroomId must be a WeChat @chatroom id");
+    if (!normalized || /\s|[\u0000-\u001f]/u.test(normalized)) {
+        throw new HttpError(400, "invalid_chatroom", "chatroomId must be a non-empty conversation id");
     }
     return normalized;
 }

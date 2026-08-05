@@ -1,0 +1,66 @@
+# Pi Bot v0.3 — LLM project context
+
+## Project identity
+
+Pi Bot is a transport-independent, persistent, multimodal agent core. The public repository is intended to be usable without shipping an IM protocol client. The source tree may be deployed as a library or as the included Admin WebUI service.
+
+## Architectural boundary
+
+```text
+External IM SDK / gateway
+  -> user-owned ChannelAdapter + ChannelPlugin
+  -> ChannelRuntime
+  -> GroupAgentCore / PiAgentRunner
+  -> durable SQLite outbox
+```
+
+The repository must not reintroduce wxhook, iPad protocol, QR/login, cookie/signature, or platform-specific client implementations. Do not add platform credentials to the core config schema.
+
+## What the core provides
+
+- Standard inbound event normalization and outbound action contracts.
+- Idempotent ingest, per-conversation serialization, durable outbox and retry-safe delivery.
+- Conversation history, group context, long-term memory, behavior learning and persona profiles.
+- Model providers, fallback chains, image understanding, voice transcription/TTS, knowledge retrieval and MCP.
+- Built-in plugins, scheduled tasks, participation decisions, emoji assets, meme generation and audit logs.
+- Admin API and React WebUI for providers, models, personas, bots, rooms, plugins, settings, logs and Adapter manifests.
+
+## What users must implement
+
+An external adapter must own the platform-specific integration:
+
+1. Login/session lifecycle, account credentials, QR/security challenges, cookies and signatures.
+2. Raw event -> `ChannelPlugin` event conversion, including stable event/conversation/sender IDs.
+3. Core outbound action -> platform send API conversion, including text, media, replies, mentions and voice.
+4. Media download/upload and `MEDIA_RESOLVE_CAPABILITY` when media needs deferred resolution.
+5. Health checks, webhook/callback registration, rate limits, reconnects and platform-specific group/contact administration.
+
+Load trusted adapter modules with `PI_CHANNEL_ADAPTER_MODULE`. The module exports `adapter` or `adapters`; each definition has a manifest and `create(context)`. Bot channel config is intentionally generic:
+
+```json
+{
+  "type": "example.im",
+  "accountId": "account-1",
+  "settings": {}
+}
+```
+
+`settings` is opaque to Core and is passed to the external adapter. Never put secrets in committed JSON, event metadata or logs.
+
+## Local commands
+
+```bash
+npm ci
+npm run check
+npm start
+```
+
+The first service start creates `data/admin-token.txt` and `data/admin-secret.key`. Use `PI_ADMIN_TOKEN` to provide a stable WebUI token. `npm run check` runs root type checks, tests, the TypeScript build, and the WebUI check/build.
+
+## Change policy
+
+- Prefer generic names: `channel`, `adapter`, `conversation`, `transport`, `platform`.
+- Keep platform integrations outside this repository or in a separately installed package.
+- When changing a public contract, update the TypeScript declaration, README, tests, and this file.
+- Do not remove durable data or change encryption namespaces without an explicit migration.
+- Treat `src/` and `webui/src/` as source of truth; generated `dist/` is build output.

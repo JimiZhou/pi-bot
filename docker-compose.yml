@@ -1,7 +1,8 @@
 services:
-  pi-wechat-agent:
-    container_name: pi-wechat-agent
-    image: pi-wechat-agent-console-v2:20260730
+  pi-bot:
+    container_name: pi-bot
+    build: .
+    image: pi-bot:0.3.0
     init: true
     restart: unless-stopped
     user: "${PI_UID:-1026}:${PI_GID:-100}"
@@ -12,32 +13,43 @@ services:
       PI_WEBUI_PORT: 8787
       PI_WEBUI_ALLOW_PUBLIC: "${PI_WEBUI_ALLOW_PUBLIC:-false}"
       PI_FALLBACK_NOTIFY_USER: "${PI_FALLBACK_NOTIFY_USER:-}"
+      PI_ADMIN_TOKEN: "${PI_ADMIN_TOKEN:-}"
+      PI_CHANNEL_ADAPTER_MODULE: "${PI_CHANNEL_ADAPTER_MODULE:-}"
+      PI_GATEWAY_HEALTH_INTERVAL_MS: "${PI_GATEWAY_HEALTH_INTERVAL_MS:-30000}"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       GOOGLE_GENERATIVE_AI_API_KEY: "${GOOGLE_GENERATIVE_AI_API_KEY:-}"
       OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
-      WX_HOOK_API_TOKEN: "${WX_HOOK_API_TOKEN:-}"
-      WX_HOOK_WEBHOOK_SECRET: "${WX_HOOK_WEBHOOK_SECRET:-}"
       PI_TTS_API_BASE_URL: "${PI_TTS_API_BASE_URL:-http://tts-api:8880}"
       PI_TTS_API_KEY: "${PI_TTS_API_KEY:-}"
       PI_TTS_API_EDGE_VOICE: "${PI_TTS_API_EDGE_VOICE:-zh-CN-XiaoxiaoNeural}"
       PI_TTS_API_KOKORO_VOICE: "${PI_TTS_API_KOKORO_VOICE:-zf_xiaoxiao}"
       PI_TTS_API_SPEED: "${PI_TTS_API_SPEED:-1}"
       PI_GEMINI_TTS_ENABLED: "${PI_GEMINI_TTS_ENABLED:-true}"
+      PI_MEME_API_BASE_URL: "${PI_MEME_API_BASE_URL:-http://meme-generator:2233}"
     volumes:
       - ./data:/app/data
+      - ./adapters:/app/adapters:ro
     ports:
       - "${PI_LAN_IP:-127.0.0.1}:8787:8787"
-      - "${PI_LAN_IP:-127.0.0.1}:9000-9099:9000-9099"
     networks:
       - default
       - google-ai-studio
-      - wechatreal08
+
+  meme-generator:
+    container_name: meme-generator
+    image: meetwq/meme-generator:latest
+    restart: unless-stopped
+    environment:
+      MEME_DIRS: '["/data/memes"]'
+      GIF_MAX_SIZE: "${MEME_GENERATOR_GIF_MAX_SIZE:-8.0}"
+      GIF_MAX_FRAMES: "${MEME_GENERATOR_GIF_MAX_FRAMES:-100}"
+    volumes:
+      - ./data/meme-generator:/data
+    expose:
+      - "2233"
 
 networks:
   google-ai-studio:
     external: true
     name: google-ai-studio-2api_default
-  wechatreal08:
-    external: true
-    name: wechatreal08_default

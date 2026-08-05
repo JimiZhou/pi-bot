@@ -189,28 +189,9 @@ export class AdminStore {
       );
       CREATE INDEX IF NOT EXISTS group_room_availability_inactive_idx
         ON group_room_availability(bot_id, inactive, updated_at DESC);
-      CREATE TABLE IF NOT EXISTS wechat_moment_automation (
-        bot_id TEXT PRIMARY KEY,
-        config_json TEXT NOT NULL,
-        updated_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS wechat_moment_actions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        bot_id TEXT NOT NULL,
-        moment_id TEXT NOT NULL,
-        author_wxid TEXT NOT NULL,
-        action TEXT NOT NULL CHECK(action IN ('like', 'comment')),
-        status TEXT NOT NULL CHECK(status IN ('claimed', 'delivered', 'dry_run', 'failed')),
-        content TEXT,
-        error TEXT,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        UNIQUE(bot_id, moment_id, action)
-      );
-      CREATE INDEX IF NOT EXISTS wechat_moment_actions_rate_idx
-        ON wechat_moment_actions(bot_id, created_at DESC);
-    `);
+        `);
         this.#migrateLegacyModelProfiles();
+        this.#deduplicateEmojisByHash();
         if (!this.#database.prepare("SELECT 1 FROM admin_settings WHERE id = 'global'").get()) {
             this.saveGlobalSettings(DEFAULT_GLOBAL_SETTINGS);
         }
@@ -238,83 +219,6 @@ export class AdminStore {
          ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json, updated_at = excluded.updated_at`)
             .run(JSON.stringify(settings), Date.now());
         return settings;
-    }
-    getWechatMomentAutomation(botId) {
-        const normalizedBotId = normalizedControlId(botId, "bot id");
-        const row = this.#database.prepare("SELECT config_json FROM wechat_moment_automation WHERE bot_id = ?").get(normalizedBotId);
-        return row
-            ? parseWechatMomentAutomation(parseJson(row.config_json, `moment automation ${normalizedBotId}`), normalizedBotId)
-            : defaultWechatMomentAutomation(normalizedBotId);
-    }
-    saveWechatMomentAutomation(botId, value) {
-        const normalizedBotId = normalizedControlId(botId, "bot id");
-        const settings = parseWechatMomentAutomation(value, normalizedBotId);
-        this.#database.prepare(`INSERT INTO wechat_moment_automation (bot_id, config_json, updated_at) VALUES (?, ?, ?)
-       ON CONFLICT(bot_id) DO UPDATE SET config_json = excluded.config_json, updated_at = excluded.updated_at`).run(normalizedBotId, JSON.stringify(settings), Date.now());
-        return settings;
-    }
-    claimWechatMomentAction(input) {
-        const botId = normalizedControlId(input.botId, "bot id");
-        const momentId = decimalControlId(input.momentId, "moment id");
-        const authorWxid = nativeControlId(input.authorWxid, "moment author wxid");
-        const now = input.now ?? Date.now();
-        if (!Number.isSafeInteger(now) || now <= 0)
-            throw new Error("Moment action timestamp is invalid");
-        const maxActionsPerDay = controlInteger(input.maxActionsPerDay, "maxActionsPerDay", 1, 100);
-        const minIntervalMinutes = controlInteger(input.minIntervalMinutes, "minIntervalMinutes", 1, 1440);
-        const content = input.content?.normalize("NFKC").trim().slice(0, 500) || undefined;
-        this.#database.exec("BEGIN IMMEDIATE");
-        try {
-            const duplicate = this.#database.prepare("SELECT id FROM wechat_moment_actions WHERE bot_id = ? AND moment_id = ? AND action = ?").get(botId, momentId, input.action);
-            if (duplicate) {
-                this.#database.exec("COMMIT");
-                return { claimed: false, reason: "duplicate" };
-            }
-            const daily = this.#database.prepare(`SELECT COUNT(*) AS count FROM wechat_moment_actions
-         WHERE bot_id = ? AND created_at >= ? AND status IN ('claimed', 'delivered', 'dry_run')`).get(botId, now - 24 * 60 * 60_000);
-            if (daily.count >= maxActionsPerDay) {
-                this.#database.exec("COMMIT");
-                return { claimed: false, reason: "daily_limit" };
-            }
-            const last = this.#database.prepare(`SELECT created_at FROM wechat_moment_actions
-         WHERE bot_id = ? AND status IN ('claimed', 'delivered', 'dry_run') ORDER BY created_at DESC LIMIT 1`).get(botId);
-            if (last && now - last.created_at < minIntervalMinutes * 60_000) {
-                this.#database.exec("COMMIT");
-                return { claimed: false, reason: "interval" };
-            }
-            const result = this.#database.prepare(`INSERT INTO wechat_moment_actions (
-          bot_id, moment_id, author_wxid, action, status, content, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, 'claimed', ?, ?, ?)`).run(botId, momentId, authorWxid, input.action, content ?? null, now, now);
-            this.#database.exec("COMMIT");
-            return { claimed: true, id: Number(result.lastInsertRowid) };
-        }
-        catch (error) {
-            this.#database.exec("ROLLBACK");
-            throw error;
-        }
-    }
-    completeWechatMomentAction(id, status, error) {
-        if (!Number.isSafeInteger(id) || id < 1)
-            throw new Error("Moment action id is invalid");
-        const normalizedError = error?.normalize("NFKC").trim().slice(0, 1000) || null;
-        const result = this.#database.prepare("UPDATE wechat_moment_actions SET status = ?, error = ?, updated_at = ? WHERE id = ? AND status = 'claimed'").run(status, normalizedError, Date.now(), id);
-        if (result.changes === 0)
-            throw new Error(`Moment action ${id} is not claimable`);
-    }
-    listWechatMomentActions(botId, limit = 100) {
-        const rows = this.#database.prepare("SELECT * FROM wechat_moment_actions WHERE bot_id = ? ORDER BY id DESC LIMIT ?").all(normalizedControlId(botId, "bot id"), controlInteger(limit, "limit", 1, 500));
-        return rows.map((row) => ({
-            id: row.id,
-            botId: row.bot_id,
-            momentId: row.moment_id,
-            authorWxid: row.author_wxid,
-            action: row.action,
-            status: row.status,
-            ...(row.content ? { content: row.content } : {}),
-            ...(row.error ? { error: row.error } : {}),
-            createdAt: row.created_at,
-            updatedAt: row.updated_at,
-        }));
     }
     listProviderProfiles() {
         const rows = this.#database
@@ -848,6 +752,20 @@ export class AdminStore {
         const row = this.#database.prepare("SELECT inactive FROM group_room_availability WHERE bot_id = ? AND conversation_id = ?").get(bot, room);
         return row?.inactive === 1;
     }
+    getGroupRoomAvailability(botId, conversationId) {
+        const bot = normalizedKey(botId);
+        const room = normalizedGroupRoomId(conversationId);
+        const row = this.#database.prepare(`SELECT consecutive_unavailable, inactive, reason, updated_at
+       FROM group_room_availability WHERE bot_id = ? AND conversation_id = ?`).get(bot, room);
+        if (!row)
+            return undefined;
+        return {
+            consecutiveUnavailable: Number(row.consecutive_unavailable),
+            inactive: row.inactive === 1,
+            ...(typeof row.reason === "string" && row.reason ? { reason: row.reason } : {}),
+            updatedAt: Number(row.updated_at),
+        };
+    }
     markGroupRoomAvailable(botId, conversationId) {
         const bot = normalizedKey(botId);
         const room = normalizedGroupRoomId(conversationId);
@@ -886,14 +804,14 @@ export class AdminStore {
         return Number(result.changes);
     }
     /**
-     * Reconciles a native iPad group-member snapshot and returns visible name
+     * Reconciles a channel-provided group-member snapshot and returns visible name
      * and presence changes relative to the preceding complete snapshot.
      * The first complete snapshot is deliberately a silent baseline.
      */
     syncGroupMemberSnapshots(conversationId, members, observedAt = Date.now()) {
         const roomId = conversationId.normalize("NFKC").trim().toLocaleLowerCase();
-        if (!roomId.endsWith("@chatroom") || roomId.includes(":")) {
-            throw new Error("Group member snapshot conversationId must be a canonical @chatroom id");
+        if (!roomId || /\s|[\u0000-\u001f]/u.test(roomId)) {
+            throw new Error("Group member snapshot conversationId must be a non-empty conversation id");
         }
         if (!Number.isSafeInteger(observedAt) || observedAt <= 0)
             throw new Error("Group member snapshot time is invalid");
@@ -902,7 +820,7 @@ export class AdminStore {
         const current = new Map();
         for (const member of members) {
             const id = normalizedSnapshotText(member.id, 300);
-            if (!id || id.endsWith("@chatroom"))
+            if (!id)
                 continue;
             const nickname = normalizedSnapshotText(member.nickname, 200);
             const displayName = normalizedSnapshotText(member.displayName, 200);
@@ -972,7 +890,8 @@ export class AdminStore {
         return row ? toEmojiRecord(row) : undefined;
     }
     saveCollectedEmoji(input) {
-        const existing = this.findEmojiByHash(input.botId, input.sha256);
+        const existingRow = this.#database.prepare("SELECT * FROM emojis WHERE sha256 = ? ORDER BY updated_at DESC LIMIT 1").get(input.sha256);
+        const existing = existingRow ? toEmojiRecord(existingRow) : undefined;
         if (existing)
             return { emoji: existing, created: false };
         const now = Date.now();
@@ -1118,6 +1037,35 @@ export class AdminStore {
             this.#database
                 .prepare("UPDATE model_profiles SET config_json = ?, updated_at = ? WHERE id = ?")
                 .run(JSON.stringify(model), Date.now(), row.id);
+        }
+    }
+    #deduplicateEmojisByHash() {
+        const hashes = this.#database.prepare("SELECT sha256 FROM emojis GROUP BY sha256 HAVING COUNT(*) > 1").all();
+        if (hashes.length === 0)
+            return;
+        this.#database.exec("BEGIN IMMEDIATE");
+        try {
+            for (const { sha256 } of hashes) {
+                const rows = this.#database.prepare(`SELECT * FROM emojis WHERE sha256 = ?
+           ORDER BY CASE status WHEN 'ready' THEN 0 WHEN 'analyzing' THEN 1 ELSE 2 END,
+                    enabled DESC, updated_at DESC`).all(sha256);
+                const keeper = rows[0];
+                if (!keeper)
+                    continue;
+                const useCount = rows.reduce((total, row) => total + row.use_count, 0);
+                const lastUsedAt = rows.reduce((latest, row) => Math.max(latest, row.last_used_at ?? 0), 0);
+                const createdAt = rows.reduce((earliest, row) => Math.min(earliest, row.created_at), keeper.created_at);
+                this.#database.prepare(`UPDATE emojis
+           SET use_count = ?, last_used_at = ?, created_at = ?, enabled = ?, updated_at = ?
+           WHERE id = ?`).run(useCount, lastUsedAt || null, createdAt, rows.some((row) => row.enabled === 1) ? 1 : 0, Date.now(), keeper.id);
+                this.#database.prepare(`DELETE FROM emojis WHERE sha256 = ? AND id <> ?`).run(sha256, keeper.id);
+            }
+            this.#database.exec("CREATE INDEX IF NOT EXISTS emojis_hash_idx ON emojis(sha256)");
+            this.#database.exec("COMMIT");
+        }
+        catch (error) {
+            this.#database.exec("ROLLBACK");
+            throw error;
         }
     }
     #availableLegacyProviderId(modelId) {
@@ -1275,66 +1223,9 @@ function taskText(value, name, min, max) {
         throw new Error(`${name} must contain between ${min} and ${max} characters`);
     return normalized;
 }
-function defaultWechatMomentAutomation(botId) {
-    return {
-        botId,
-        enabled: false,
-        autoLike: false,
-        autoComment: false,
-        allowedAuthorWxids: [],
-        maxActionsPerDay: 5,
-        minIntervalMinutes: 30,
-        lookbackMinutes: 180,
-        commentTemplates: [],
-        dryRun: true,
-    };
-}
-function parseWechatMomentAutomation(value, botId) {
-    if (!isRecord(value))
-        throw new Error("Moment automation settings must be an object");
-    const enabled = value.enabled === true;
-    const autoLike = value.autoLike === true;
-    const autoComment = value.autoComment === true;
-    const authors = Array.isArray(value.allowedAuthorWxids) ? value.allowedAuthorWxids : [];
-    if (authors.some((item) => typeof item !== "string"))
-        throw new Error("allowedAuthorWxids must contain strings");
-    const allowedAuthorWxids = [...new Set(authors.map((item) => nativeControlId(item, "allowed author wxid")))];
-    if (allowedAuthorWxids.length > 100)
-        throw new Error("allowedAuthorWxids cannot exceed 100 entries");
-    const templates = Array.isArray(value.commentTemplates) ? value.commentTemplates : [];
-    if (templates.some((item) => typeof item !== "string"))
-        throw new Error("commentTemplates must contain strings");
-    const commentTemplates = [...new Set(templates.map((item) => taskText(item, "comment template", 1, 500)))];
-    if (commentTemplates.length > 20)
-        throw new Error("commentTemplates cannot exceed 20 entries");
-    if (enabled && !autoLike && !autoComment)
-        throw new Error("Moment automation must enable likes or comments");
-    if (enabled && allowedAuthorWxids.length === 0)
-        throw new Error("Moment automation requires an explicit author allowlist");
-    if (enabled && autoComment && commentTemplates.length === 0)
-        throw new Error("Automatic comments require at least one template");
-    return {
-        botId,
-        enabled,
-        autoLike,
-        autoComment,
-        allowedAuthorWxids,
-        maxActionsPerDay: controlInteger(value.maxActionsPerDay ?? 5, "maxActionsPerDay", 1, 100),
-        minIntervalMinutes: controlInteger(value.minIntervalMinutes ?? 30, "minIntervalMinutes", 1, 1440),
-        lookbackMinutes: controlInteger(value.lookbackMinutes ?? 180, "lookbackMinutes", 10, 1440),
-        commentTemplates,
-        dryRun: value.dryRun !== false,
-    };
-}
 function normalizedControlId(value, name) {
     const normalized = taskText(value, name, 1, 128);
     if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/u.test(normalized))
-        throw new Error(`${name} is invalid`);
-    return normalized;
-}
-function nativeControlId(value, name) {
-    const normalized = taskText(value, name, 1, 300);
-    if (/[\u0000-\u001f\s]/u.test(normalized))
         throw new Error(`${name} is invalid`);
     return normalized;
 }
@@ -1394,8 +1285,8 @@ function normalizedSnapshotText(value, max) {
 }
 function normalizedGroupRoomId(value) {
     const room = normalizedKey(value).toLocaleLowerCase();
-    if (!room.endsWith("@chatroom") || room.includes(":")) {
-        throw new Error("Group room id must be a canonical @chatroom id");
+    if (!room || /\s|[\u0000-\u001f]/u.test(room)) {
+        throw new Error("Group room id must be a non-empty conversation id");
     }
     return room;
 }

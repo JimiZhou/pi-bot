@@ -101,6 +101,10 @@ export {
   magnetCodeSearchPluginFactory,
   parseCatalogCode,
   searchMagnets,
+  MemeGeneratorPlugin,
+  memeGeneratorPluginFactory,
+  parseMemeCommand,
+  compressForChat,
   ScheduledTaskPlugin,
   createScheduledTaskToolProvider,
   isScheduledTaskIntent,
@@ -126,7 +130,6 @@ export { SharedConversationState, fusedMessageId } from "./shared-conversation-s
 export {
   canonicalIdentity,
   replaceTransportIds,
-  replaceWechatIds,
   safeGroupDisplayName,
 } from "./display-name.js";
 export {
@@ -231,38 +234,11 @@ export type {
   TriggerPolicy,
 } from "./types.js";
 
-// Private deployment compatibility layer recovered from the production image.
-export { toWechatPlainText } from "./wechat-text.js";
-export {
-  WechatIpadApiClient,
-  WechatIpadApiError,
-  createWechatIpadChannel,
-  isWechatIpadSessionInvalidError,
-  isWechatIpadCallbackSourceAllowed,
-  normalizeWechatIpadMessage,
-  parseWechatIpadSyncEnvelope,
-  wechatIpadSilkBitrateForPcmBytes,
-  wechatIpadCallbackMessages,
-  wechatIpadCallbackGroupContactChanges,
-} from "./adapters/wechat-ipad.js";
-export {
-  WxHookGatewayClient,
-  WxHookGatewayError,
-  createWxHookHttpChannel,
-  normalizeWxHookMessage,
-  verifyWxHookWebhookSignature,
-} from "./adapters/wx-hook-http.js";
-export {
-  createWechatAdapterRegistry,
-  wechatIpadAdapter,
-  wxHookHttpAdapter,
-} from "./adapters/definitions.js";
 export {
   AdminStore,
   AdminServer,
   probeProvider,
   AgentSupervisor,
-  WechatIpadLoginManager,
 } from "./admin/index.js";
 export {
   DEFAULT_BOT_LIMITS,

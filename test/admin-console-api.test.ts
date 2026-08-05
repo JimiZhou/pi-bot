@@ -5,7 +5,7 @@ import { AdminServer } from "../src/admin/server.js"
 
 const TOKEN = "test-admin-token-0123456789"
 
-test("console manifest exposes the versioned core and adapter extension contract", async (context) => {
+test("console manifest exposes the versioned core and external adapter contract", async (context) => {
   const server = new AdminServer({
     store: { appendLog() {} } as never,
     supervisor: {} as never,
@@ -33,10 +33,6 @@ test("console manifest exposes the versioned core and adapter extension contract
     adapters: Array<{ apiVersion: number; type: string; displayName: string }>
   }
   assert.equal(manifest.apiVersion, 1)
-  assert.deepEqual(manifest.modules, ["core", "wechat"])
-  assert.deepEqual(
-    manifest.adapters.map((adapter) => adapter.type).sort(),
-    ["wechat-ipad", "wx-hook-http"],
-  )
-  assert.ok(manifest.adapters.every((adapter) => adapter.apiVersion === 1 && adapter.displayName))
+  assert.deepEqual(manifest.modules, ["core", "adapters"])
+  assert.deepEqual(manifest.adapters, [])
 })

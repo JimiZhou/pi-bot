@@ -3,5 +3,4 @@ export { DEFAULT_BOT_LIMITS, DEFAULT_GLOBAL_SETTINGS, parseBotConfig, parseGloba
 export { AdminServer } from "./server.js";
 export { probeProvider, } from "./provider-client.js";
 export { AgentSupervisor, } from "./supervisor.js";
-export { WechatIpadLoginManager, } from "./wechat-ipad-login.js";
 //# sourceMappingURL=index.js.map

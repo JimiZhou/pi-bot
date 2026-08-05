@@ -38,7 +38,6 @@ const groupLabels: Record<ConsoleModuleGroup, string> = {
   runtime: "运行",
   intelligence: "AI 配置",
   conversations: "对话与数据",
-  wechat: "WeChat 扩展",
   system: "系统",
 }
 
@@ -46,7 +45,6 @@ const groupOrder: ConsoleModuleGroup[] = [
   "runtime",
   "intelligence",
   "conversations",
-  "wechat",
   "system",
 ]
 

@@ -48,6 +48,12 @@ test("opaque transport ids are replaced by known display names", () => {
   assert.match(turn, /链家老王/u);
 });
 
+test("short opaque transport ids are never treated as readable nicknames", () => {
+  assert.equal(safeGroupDisplayName("account_jay123", "account:account_jay123"), "群友");
+  assert.equal(safeGroupDisplayName("service_service42", "account:service_service42"), "群友");
+  assert.equal(safeGroupDisplayName("周凯烨", "account:account_jay123"), "周凯烨");
+});
+
 test("a persona name takes precedence over the transport account display name", () => {
   const system = buildSystemPrompt(
     { id: "bot-1", displayName: "欧本克劳" },

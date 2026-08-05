@@ -73,41 +73,11 @@ export interface PersonaProfile {
   enabled: boolean
 }
 
-export interface WxHookChannelConfig {
-  type: "wx-hook-http"
-  gatewayBaseUrl: string
-  apiTokenEnv: string
-  gatewayTimeoutMs: number
-  webhookHost: string
-  webhookPort: number
-  webhookPath: string
-  webhookSecretEnv: string
+export interface BotChannelConfig {
+  type: string
   accountId?: string
-  acceptUnknownGroupSenders: boolean
-  nativeQuoteReplies: boolean
-  ingestRetryMs: number
+  settings: Record<string, unknown>
 }
-
-export interface WechatIpadChannelConfig {
-  type: "wechat-ipad"
-  apiBaseUrl: string
-  accountWxid: string
-  apiTokenEnv?: string
-  apiTimeoutMs: number
-  callbackHost: string
-  callbackPort: number
-  callbackPathPrefix: string
-  callbackAllowedSourceIps: string[]
-  callbackMaxBodyBytes: number
-  callbackRouterBaseUrl: string
-  callbackAdvertiseHost: string
-  autoRegisterCallback: boolean
-  registerIntervalMs: number
-  accountId?: string
-  ingestRetryMs: number
-}
-
-export type BotChannelConfig = WxHookChannelConfig | WechatIpadChannelConfig
 
 export interface BotAgentLimits {
   historyLimit: number
@@ -404,13 +374,46 @@ export interface ParticipationSummary {
 
 export interface EmojiRecord {
   id: string
+  botId: string
   description: string
+  status: "analyzing" | "ready" | "failed"
   enabled: boolean
   isThinking: boolean
   mimeType: string
   size: number
+  error?: string
   createdAt: number
   updatedAt: number
+}
+
+export interface MemeInfo {
+  key: string
+  keywords: string[]
+  minImages: number
+  maxImages: number
+  minTexts: number
+  maxTexts: number
+}
+
+export interface CustomMemeRecord {
+  key: string
+  title: string
+  keywords: string[]
+  mimeType: string
+  size: number
+  filename: string
+  createdAt: number
+  updatedAt: number
+  minImages: 0
+  maxImages: 0
+  minTexts: 0
+  maxTexts: 0
+}
+
+export interface MemeGenerationResult {
+  mimeType: string
+  size: number
+  data: string
 }
 
 export interface AdminLogRecord {

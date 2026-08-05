@@ -1,71 +1,46 @@
 # Console architecture
 
-The React Console is the primary administration surface. The recovered legacy
-HTML application remains packaged only as a rollback aid; the React navigation
-does not link to it.
+The React Console is the primary administration surface for Pi Bot v0.3. It
+manages the transport-independent Core and shows externally registered Adapter
+manifests; it does not contain a platform login flow or protocol client.
 
-## Merge boundary
+## Layers
 
-The Console is intentionally split into three layers so the repository can keep
-following the public `pi-bot` project without re-applying WeChat-specific edits
-throughout upstream components.
+1. **Console shell** — navigation, authentication, layout, theme and loading
+   states.
+2. **Core admin modules** — Bot lifecycle, Provider/model profiles, knowledge,
+   MCP, personas, plugins, conversations, evaluation, settings, logs and
+   runtime status.
+3. **External Adapter** — a trusted module loaded with
+   `PI_CHANNEL_ADAPTER_MODULE`. Its manifest and runtime instance are displayed
+   by the Adapter page, while its opaque `channel.settings` are edited as JSON
+   in the Bot page.
 
-1. **Console shell** — navigation, authentication, layout, theme, loading states,
-   and the `ConsoleModule` registry. This is the upstream-friendly layer.
-2. **Core admin modules** — Bot orchestration, Adapter manifests, Provider/model
-   profiles, knowledge, MCP, personas, plugins, conversations, evaluation,
-   settings, logs, and runtime status. These depend only on the typed Admin API.
-3. **WeChat Console extension** — wx_hook/iPad configuration editors, login,
-   identity, contacts, Moments, group administration, and emoji management.
-   These live below `webui/src/extensions/wechat` and
-   `webui/src/features/wechat`.
+The server advertises the contract through `GET /api/v1/console-manifest` and
+`GET /api/adapters`. The default registry is empty by design. Registering an
+Adapter is an explicit deployment decision; installing or importing a package
+does not silently activate it.
 
-The server advertises enabled extension families at
-`GET /api/v1/console-manifest`. The client registers the WeChat modules only
-when the manifest contains `wechat`. Adapter runtime contracts and Admin UI
-contracts remain separate:
+## Adapter boundary
 
-- `ChannelAdapter` and its manifest own message transport and runtime
-  capabilities.
-- `AdapterAdminExtension` owns only configuration fields, defaults, and
-  form-to-config conversion.
+The external Adapter owns login/session state, raw event conversion, outbound
+platform calls, media resolution, health checks, callbacks, reconnects and
+platform-specific administration. Core owns durable conversation state,
+memory, model execution, plugin orchestration and reliable outbox semantics.
 
-This prevents browser concerns from entering the standard Bot runtime while
-still allowing an Adapter package to supply a complete management experience.
+This means wxhook, iPad protocol clients, QR/login UI, cookies, signatures and
+platform credentials are intentionally absent from the public project. A
+platform-specific Console can be shipped by the Adapter package if needed,
+without adding that protocol to the Core repository.
 
-## Upstream update workflow
+## Updating the Console
 
-The local `wechat-console-v2` branch is based directly on public revision
-`4997b3677863233cd20ec7adb4a8e6ab5b19a9c3`. The `upstream` remote is configured
-as fetch-only so the private runtime cannot be pushed to the public repository
-by accident.
+When changing a generic Admin endpoint:
 
-When merging a newer public `pi-bot` revision:
+1. Update the server implementation and its declaration.
+2. Update `webui/src/lib/admin-client.ts` and the affected module.
+3. Add or update an API contract test.
+4. Run `npm run check`.
 
-1. Merge changes to the shell, console primitives, design tokens, and generic
-   core pages first.
-2. Keep `AdminClient`, `ConsoleModule`, and `AdapterAdminExtension` contracts
-   stable or update them in one compatibility commit.
-3. Rebase the files under `extensions/wechat` and `features/wechat` only when a
-   contract changes; they should not require edits for visual-only upstream
-   updates.
-4. Run `npm run check`, build an isolated candidate image, and verify the
-   Console against a copied data directory before replacing the production
-   container.
-
-## Legacy coverage
-
-The React Console now owns all legacy navigation domains:
-
-- Bot lifecycle and complete Bot configuration
-- Provider, model, knowledge, MCP, persona, plugin, and global settings
-- Adapter manifests and instances
-- Group configuration, history/send, scheduled tasks, memories, and native
-  WeChat group administration
-- Emoji library and participation-quality review
-- WeChat login, identity, contacts/labels, and Moments automation
-- Logs and runtime health
-
-Any future Admin endpoint must be added to `AdminClient` (or a typed extension
-client), exposed through a registered module, and covered by an API contract
-test before the legacy rollback surface can be removed.
+Keep `src/` and `webui/src/` as source of truth. `dist/` and `webui/dist/`
+are generated output and should not be edited manually.

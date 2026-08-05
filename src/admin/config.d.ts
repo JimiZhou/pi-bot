@@ -64,15 +64,15 @@ export interface PersonaProfile {
     id: string;
     label: string;
     prompt: string;
-    /** Persona-facing name used for self-reference and optional WeChat profile sync. */
+    /** Persona-facing name used for self-reference and optional adapter identity sync. */
     accountNickname?: string;
-    /** Per-room WeChat display name. The deployed 874 service needs an extra route before this can sync. */
+    /** Per-room display name understood by adapters that support conversation identity. */
     groupNickname?: string;
     /** Conversation-scoped aliases that wake this persona in addition to the Bot defaults. */
     wakeWords: string[];
-    /** Administrator-provided avatar preset. Kept as a validated image data URL for direct protocol upload. */
+    /** Administrator-provided avatar preset for adapters that support identity updates. */
     avatarDataUrl?: string;
-    /** Applying this persona may update the global WeChat nickname/avatar. */
+    /** Applying this persona may update the adapter account nickname/avatar. */
     autoApplyAccountProfile: boolean;
     enabled: boolean;
 }
@@ -98,39 +98,11 @@ export interface ChatroomPluginOverride {
     pluginType: string;
     enabled: boolean;
 }
-export interface WxHookChannelConfig {
-    type: "wx-hook-http";
-    gatewayBaseUrl: string;
-    apiTokenEnv: string;
-    gatewayTimeoutMs: number;
-    webhookHost: string;
-    webhookPort: number;
-    webhookPath: string;
-    webhookSecretEnv: string;
+export interface BotChannelConfig {
+    type: string;
     accountId?: string;
-    acceptUnknownGroupSenders: boolean;
-    nativeQuoteReplies: boolean;
-    ingestRetryMs: number;
+    settings: Record<string, unknown>;
 }
-export interface WechatIpadChannelConfig {
-    type: "wechat-ipad";
-    apiBaseUrl: string;
-    accountWxid: string;
-    apiTokenEnv?: string;
-    apiTimeoutMs: number;
-    callbackHost: string;
-    callbackPort: number;
-    callbackPathPrefix: string;
-    callbackAllowedSourceIps: string[];
-    callbackMaxBodyBytes: number;
-    callbackRouterBaseUrl: string;
-    callbackAdvertiseHost: string;
-    autoRegisterCallback: boolean;
-    registerIntervalMs: number;
-    accountId?: string;
-    ingestRetryMs: number;
-}
-export type BotChannelConfig = WxHookChannelConfig | WechatIpadChannelConfig;
 export interface BotAgentLimits {
     historyLimit: number;
     maxHistoryChars: number;
@@ -186,7 +158,7 @@ export interface BotConfig {
     chatModelProfileId: string | null;
     /** Optional low-cost model for deterministic short/simple turns. */
     fastChatModelProfileId: string | null;
-    /** Dedicated local model used only for ambiguous group participation decisions. */
+    /** Dedicated Gemini model used only for ambiguous group participation decisions. */
     participationJudgeModelProfileId: string | null;
     /** Ordered cross-provider fallbacks used after the primary/provider-internal chain is exhausted. */
     fallbackChatModelProfileIds: string[];

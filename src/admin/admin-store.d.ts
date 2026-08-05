@@ -27,30 +27,6 @@ export interface AdminStoreOptions {
     /** 32-byte key used only to encrypt provider API keys at rest. */
     secretKey?: Uint8Array;
 }
-export interface WechatMomentAutomationSettings {
-    botId: string;
-    enabled: boolean;
-    autoLike: boolean;
-    autoComment: boolean;
-    allowedAuthorWxids: string[];
-    maxActionsPerDay: number;
-    minIntervalMinutes: number;
-    lookbackMinutes: number;
-    commentTemplates: string[];
-    dryRun: boolean;
-}
-export interface WechatMomentActionRecord {
-    id: number;
-    botId: string;
-    momentId: string;
-    authorWxid: string;
-    action: "like" | "comment";
-    status: "claimed" | "delivered" | "dry_run" | "failed";
-    content?: string;
-    error?: string;
-    createdAt: number;
-    updatedAt: number;
-}
 export interface ProactiveClaimInput {
     claimKey: string;
     canonicalConversationId: string;
@@ -109,24 +85,6 @@ export declare class AdminStore implements ScheduledTaskRepository {
     close(): void;
     getGlobalSettings(): GlobalSettings;
     saveGlobalSettings(value: unknown): GlobalSettings;
-    getWechatMomentAutomation(botId: string): WechatMomentAutomationSettings;
-    saveWechatMomentAutomation(botId: string, value: unknown): WechatMomentAutomationSettings;
-    claimWechatMomentAction(input: {
-        botId: string;
-        momentId: string;
-        authorWxid: string;
-        action: "like" | "comment";
-        content?: string;
-        maxActionsPerDay: number;
-        minIntervalMinutes: number;
-        now?: number;
-    }): {
-        claimed: boolean;
-        reason?: string;
-        id?: number;
-    };
-    completeWechatMomentAction(id: number, status: "delivered" | "dry_run" | "failed", error?: string): void;
-    listWechatMomentActions(botId: string, limit?: number): WechatMomentActionRecord[];
     listProviderProfiles(): ProviderProfileSummary[];
     getProviderProfile(id: string): ProviderProfileSummary | undefined;
     saveProviderProfile(value: unknown, apiKeyUpdate?: string | null): ProviderProfileSummary;
@@ -204,6 +162,12 @@ export declare class AdminStore implements ScheduledTaskRepository {
         deleted: number;
     };
     isGroupRoomInactive(botId: string, conversationId: string): boolean;
+    getGroupRoomAvailability(botId: string, conversationId: string): {
+        consecutiveUnavailable: number;
+        inactive: boolean;
+        reason?: string;
+        updatedAt: number;
+    } | undefined;
     markGroupRoomAvailable(botId: string, conversationId: string): boolean;
     noteGroupRoomUnavailable(botId: string, conversationId: string, reason: string, confirmed?: boolean, observedAt?: number): {
         consecutive: number;
@@ -211,7 +175,7 @@ export declare class AdminStore implements ScheduledTaskRepository {
     };
     deleteGroupMemberSnapshots(conversationId: string): number;
     /**
-     * Reconciles a native iPad group-member snapshot and returns visible name
+     * Reconciles a channel-provided group-member snapshot and returns visible name
      * and presence changes relative to the preceding complete snapshot.
      * The first complete snapshot is deliberately a silent baseline.
      */

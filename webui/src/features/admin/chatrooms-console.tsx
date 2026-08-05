@@ -20,6 +20,7 @@ import {
   TextareaField,
 } from "@/components/admin-primitives"
 import { EmptyState, PageHeader, StatusPill } from "@/components/console-primitives"
+import { EmojiPreview } from "@/components/emoji-preview"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -43,8 +44,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useAdminResource } from "@/hooks/use-admin-resource"
 import { useAdmin } from "@/lib/admin-context"
 import { formBoolean, formNumber, formText, lines } from "@/lib/form-data"
-import type { BootstrapPayload, ChatroomRecord, ScheduledTask, StoredMessage } from "@/types/admin"
-import { GroupManagement } from "@/features/wechat/group-management"
+import type { BootstrapPayload, ChatroomRecord, PluginCatalogEntry, ScheduledTask, StoredMessage } from "@/types/admin"
 
 function roomTitle(room: ChatroomRecord) {
   return room.label || room.title || room.chatroomId
@@ -52,6 +52,10 @@ function roomTitle(room: ChatroomRecord) {
 
 function canonicalRoomId(value: string) {
   return value.normalize("NFKC").trim().toLocaleLowerCase().split(":").at(-1) ?? ""
+}
+
+function roomKey(room: Pick<ChatroomRecord, "botId" | "chatroomId">) {
+  return `${room.botId}:${canonicalRoomId(room.chatroomId)}`
 }
 
 type TaskScheduleType = "once" | "daily" | "weekly"
@@ -78,6 +82,87 @@ function timestampToLocalInput(timestamp: unknown, timezoneOffsetMinutes: number
 
 function localInputToTimestamp(value: string, timezoneOffsetMinutes: number) {
   return Date.parse(`${value}:00Z`) - timezoneOffsetMinutes * 60_000
+}
+
+function BulkPluginEditor({
+  rooms,
+  catalog,
+  selectedRoomKeys,
+  onSelectAll,
+  onSelectAllRooms,
+  onClear,
+  onApply,
+}: {
+  rooms: ChatroomRecord[]
+  catalog: PluginCatalogEntry[]
+  selectedRoomKeys: Set<string>
+  onSelectAll: () => void
+  onSelectAllRooms: () => void
+  onClear: () => void
+  onApply: (pluginChanges: Record<string, boolean>) => Promise<void>
+}) {
+  const [changes, setChanges] = useState<Record<string, string>>({})
+  const pluginTypes = catalog.length > 0
+    ? catalog
+    : [...new Set(rooms.flatMap((room) => room.plugins.map((plugin) => plugin.type)))].map((type) => ({
+        type,
+        name: type,
+        description: "",
+      }))
+  const selectedCount = selectedRoomKeys.size
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const pluginChanges = Object.fromEntries(
+      Object.entries(changes)
+        .filter(([, value]) => value === "on" || value === "off")
+        .map(([type, value]) => [type, value === "on"]),
+    )
+    if (selectedCount === 0 || Object.keys(pluginChanges).length === 0) return
+    await onApply(pluginChanges)
+    setChanges({})
+  }
+
+  return (
+    <Card className="shadow-none">
+      <CardHeader>
+        <CardTitle>批量配置群聊插件</CardTitle>
+        <CardDescription>
+          已选择 {selectedCount} 个群，当前显示 {rooms.length} 个群。留空的插件不会修改；提交会按每批 200 个群自动处理。
+        </CardDescription>
+        <CardAction className="flex gap-2">
+          <Button type="button" variant="outline" size="sm" onClick={onSelectAll} disabled={rooms.length === 0}>全选当前结果</Button>
+          <Button type="button" variant="outline" size="sm" onClick={onSelectAllRooms} disabled={rooms.length === 0}>全选全部群聊</Button>
+          <Button type="button" variant="ghost" size="sm" onClick={onClear} disabled={selectedCount === 0}>清空选择</Button>
+        </CardAction>
+      </CardHeader>
+      <CardContent>
+        <form onSubmit={submit} className="space-y-4">
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {pluginTypes.map((plugin) => (
+              <SelectField
+                key={plugin.type}
+                label={plugin.name}
+                name={`bulk-plugin:${plugin.type}`}
+                value={changes[plugin.type] ?? ""}
+                onValueChange={(value) => setChanges((current) => ({ ...current, [plugin.type]: value }))}
+                options={[
+                  { value: "", label: "不修改" },
+                  { value: "on", label: "强制开启" },
+                  { value: "off", label: "强制关闭" },
+                ]}
+              />
+            ))}
+          </div>
+          <div className="flex justify-end">
+            <Button type="submit" disabled={selectedCount === 0 || !Object.values(changes).some((value) => value === "on" || value === "off")}>
+              <Settings2 data-icon="inline-start" /> 应用到已选群聊
+            </Button>
+          </div>
+        </form>
+      </CardContent>
+    </Card>
+  )
 }
 
 function ScheduledTaskEditor({
@@ -208,6 +293,7 @@ function ChatroomDialog({
   const [historyHasMore, setHistoryHasMore] = useState<boolean | null>(null)
   const [historyLoading, setHistoryLoading] = useState(false)
   const [historyError, setHistoryError] = useState("")
+  const [selectedEmojiId, setSelectedEmojiId] = useState("")
   const bot = bootstrap.bots.find((item) => item.id === room.botId)
   const load = useCallback(async () => {
     const [messages, memories, tasks, emojis] = await Promise.all([
@@ -222,7 +308,7 @@ function ChatroomDialog({
       tasks: tasks.tasks.filter((task) =>
         (room.botIds?.includes(task.botId) ?? task.botId === room.botId)
         && canonicalRoomId(task.conversationId) === canonicalRoomId(room.chatroomId)),
-      emojis: emojis.emojis.filter((emoji) => emoji.enabled),
+      emojis: emojis.emojis.filter((emoji) => emoji.enabled && emoji.status === "ready"),
     }
   }, [client, room.botId, room.botIds, room.chatroomId])
   const resource = useAdminResource(load)
@@ -257,7 +343,7 @@ function ChatroomDialog({
     event.preventDefault()
     const data = new FormData(event.currentTarget)
     const text = formText(data, "message")
-    const emojiId = formText(data, "emojiId")
+    const emojiId = selectedEmojiId
     if (!text && !emojiId) return
     const result = await resource.mutate(
       () => client.sendChatroomMessage(
@@ -267,7 +353,10 @@ function ChatroomDialog({
       ),
       emojiId ? "表情包已发送" : "消息已发送",
     )
-    if (result) event.currentTarget.reset()
+    if (result) {
+      event.currentTarget.reset()
+      setSelectedEmojiId("")
+    }
   }
 
   async function createMemory(event: FormEvent<HTMLFormElement>) {
@@ -314,6 +403,12 @@ function ChatroomDialog({
     { value: "", label: "继承 Bot / 全局" },
     ...bootstrap.models.map((model) => ({ value: model.id, label: model.label })),
   ]
+  const visionModelOptions = [
+    { value: "", label: "继承 Bot / 自动选择 Gemini" },
+    ...(bootstrap?.models ?? [])
+      .filter((model) => model.input.includes("image"))
+      .map((model) => ({ value: model.id, label: model.label })),
+  ]
   const personaOptions = [
     { value: "", label: "继承 Bot / 全局" },
     ...bootstrap.personas.map((persona) => ({ value: persona.id, label: persona.label })),
@@ -335,7 +430,6 @@ function ChatroomDialog({
               <TabsTrigger value="history">历史与发送</TabsTrigger>
               <TabsTrigger value="tasks">定时任务</TabsTrigger>
               <TabsTrigger value="memories">持久记忆</TabsTrigger>
-              {bot?.channel.type === "wechat-ipad" ? <TabsTrigger value="wechat">微信群设置</TabsTrigger> : null}
             </TabsList>
             <TabsContent value="config" className="py-4">
               <form onSubmit={saveConfig} className="space-y-5">
@@ -352,7 +446,7 @@ function ChatroomDialog({
                     ]}
                   />
                   <SelectField label="对话模型" name="chatModelProfileId" defaultValue={room.chatModelProfileId ?? ""} options={modelOptions} />
-                  <SelectField label="视觉模型" name="visionModelProfileId" defaultValue={room.visionModelProfileId ?? ""} options={modelOptions} />
+                  <SelectField label="视觉模型" name="visionModelProfileId" defaultValue={room.visionModelProfileId ?? ""} options={visionModelOptions} />
                   <SelectField label="人格" name="personaProfileId" defaultValue={room.personaProfileId ?? ""} options={personaOptions} />
                   <SelectField
                     label="TTS 音色"
@@ -443,13 +537,40 @@ function ChatroomDialog({
                   <EmptyState title="暂无聊天记录" description="新消息会进入统一会话存储。" />
                 ) : null}
               </div>
-              <form onSubmit={sendMessage} className="flex flex-wrap gap-2">
-                <Input name="message" placeholder={`以 ${bot?.displayName ?? room.botDisplayName} 身份发送文字`} className="min-w-60 flex-1" />
-                <select name="emojiId" className="h-8 max-w-56 rounded-lg border bg-background px-2.5 text-sm">
-                  <option value="">不发送表情包</option>
-                  {(resource.data?.emojis ?? []).map((emoji) => <option key={emoji.id} value={emoji.id}>{emoji.description}</option>)}
-                </select>
-                <Button type="submit"><Send data-icon="inline-start" /> 发送</Button>
+              <form onSubmit={sendMessage} className="space-y-3">
+                <div className="flex flex-wrap gap-2">
+                  <Input
+                    name="message"
+                    disabled={Boolean(selectedEmojiId)}
+                    placeholder={selectedEmojiId ? "已选择表情包，将只发送表情" : `以 ${bot?.displayName ?? room.botDisplayName} 身份发送文字`}
+                    className="min-w-60 flex-1"
+                  />
+                  <Button type="submit"><Send data-icon="inline-start" /> 发送</Button>
+                </div>
+                {(resource.data?.emojis.length ?? 0) > 0 ? (
+                  <div className="max-h-52 overflow-y-auto rounded-xl border p-2">
+                    <div className="grid grid-cols-4 gap-2 sm:grid-cols-6 md:grid-cols-8">
+                      {(resource.data?.emojis ?? []).map((emoji) => {
+                        const selected = selectedEmojiId === emoji.id
+                        return (
+                          <button
+                            key={emoji.id}
+                            type="button"
+                            title={emoji.description}
+                            aria-pressed={selected}
+                            className={`rounded-lg border p-1.5 text-left transition ${selected ? "border-primary bg-primary/10 ring-2 ring-primary/30" : "hover:bg-muted"}`}
+                            onClick={() => setSelectedEmojiId(selected ? "" : emoji.id)}
+                          >
+                            <EmojiPreview emoji={emoji} className="aspect-square w-full rounded object-contain" />
+                            <span className="mt-1 block truncate text-[10px] text-muted-foreground">
+                              {emoji.description || "未命名表情"}
+                            </span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                ) : null}
               </form>
             </TabsContent>
             <TabsContent value="tasks" className="space-y-3 py-4">
@@ -559,11 +680,6 @@ function ChatroomDialog({
                 </div>
               </details>
             </TabsContent>
-            {bot?.channel.type === "wechat-ipad" ? (
-              <TabsContent value="wechat" className="py-4">
-                <GroupManagement client={client} botId={bot.id} chatroomId={room.chatroomId} />
-              </TabsContent>
-            ) : null}
           </Tabs>
         ) : null}
       </DialogContent>
@@ -574,17 +690,40 @@ function ChatroomDialog({
 export default function ChatroomsConsole() {
   const { client } = useAdmin()
   const load = useCallback(async () => {
-    const [rooms, bootstrap] = await Promise.all([client.chatrooms(), client.bootstrap()])
-    return { rooms: rooms.chatrooms, bootstrap }
+    const [rooms, bootstrap, plugins] = await Promise.all([client.chatrooms(), client.bootstrap(), client.plugins()])
+    return { rooms: rooms.chatrooms, bootstrap, pluginCatalog: plugins.catalog }
   }, [client])
   const resource = useAdminResource(load)
   const [query, setQuery] = useState("")
   const [selected, setSelected] = useState<ChatroomRecord | null>(null)
+  const [selectedRoomKeys, setSelectedRoomKeys] = useState<Set<string>>(new Set())
   const rooms = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase()
     return (resource.data?.rooms ?? []).filter((room) =>
       !normalized || roomTitle(room).toLocaleLowerCase().includes(normalized) || room.chatroomId.toLocaleLowerCase().includes(normalized))
   }, [query, resource.data?.rooms])
+  const allRooms = resource.data?.rooms ?? []
+
+  function toggleRoom(room: ChatroomRecord) {
+    const key = roomKey(room)
+    setSelectedRoomKeys((current) => {
+      const next = new Set(current)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+
+  async function applyBulkPlugins(pluginChanges: Record<string, boolean>) {
+    const targets = allRooms
+      .filter((room) => selectedRoomKeys.has(roomKey(room)))
+      .map((room) => ({ botId: room.botId, chatroomId: room.chatroomId }))
+    const result = await resource.mutate(
+      () => client.bulkChatrooms(targets, pluginChanges),
+      `已批量更新 ${targets.length} 个群聊的插件配置`,
+    )
+    if (result) setSelectedRoomKeys(new Set())
+  }
 
   return (
     <div className="space-y-6">
@@ -601,13 +740,36 @@ export default function ChatroomsConsole() {
       </div>
       {resource.loading ? <AdminLoading label="正在加载群聊" /> : null}
       {!resource.loading && rooms.length === 0 ? <EmptyState title="没有匹配的群聊" description="群聊会在收到第一条消息后自动发现。" /> : null}
+      {!resource.loading && rooms.length > 0 ? (
+        <BulkPluginEditor
+          rooms={rooms}
+          catalog={resource.data?.pluginCatalog ?? []}
+          selectedRoomKeys={selectedRoomKeys}
+          onSelectAll={() => setSelectedRoomKeys((current) => new Set([...current, ...rooms.map(roomKey)]))}
+          onSelectAllRooms={() => setSelectedRoomKeys((current) => new Set([...current, ...allRooms.map(roomKey)]))}
+          onClear={() => setSelectedRoomKeys(new Set())}
+          onApply={applyBulkPlugins}
+        />
+      ) : null}
       <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-3">
         {rooms.map((room) => (
           <Card key={`${room.botId}:${room.chatroomId}`} className="shadow-none">
             <CardHeader>
-              <span className="mb-2 flex size-10 items-center justify-center rounded-xl bg-indigo-50 text-indigo-600 dark:bg-indigo-950 dark:text-indigo-300">
-                <Users className="size-5" />
-              </span>
+              <div className="flex items-center justify-between gap-3">
+                <span className="flex size-10 items-center justify-center rounded-xl bg-indigo-50 text-indigo-600 dark:bg-indigo-950 dark:text-indigo-300">
+                  <Users className="size-5" />
+                </span>
+                <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={selectedRoomKeys.has(roomKey(room))}
+                    onChange={() => toggleRoom(room)}
+                    aria-label={`选择${roomTitle(room)}`}
+                    className="size-4 rounded border-input accent-primary"
+                  />
+                  批量选择
+                </label>
+              </div>
               <CardTitle>{roomTitle(room)}</CardTitle>
               <CardDescription className="truncate">{room.chatroomId}</CardDescription>
               <CardAction><Badge variant="secondary">{room.botIds?.length ?? 1} 个账号</Badge></CardAction>

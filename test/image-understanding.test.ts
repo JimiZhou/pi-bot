@@ -111,6 +111,8 @@ test("the image tool is absent without an image and never resolves media unless 
 
     await channel!.ingest(imageEvent("image-1", "随手发张图"));
     assert.equal(requests[1]!.tools.some((tool) => tool.name === "understand_image"), true);
+    assert.match(requests[1]!.prompt, /必须先调用它获取事实/u);
+    assert.doesNotMatch(requests[1]!.prompt, /当前回合没有可用的图片理解工具/u);
     assert.equal(resolves, 0);
     assert.equal(provider.requests.length, 0);
   } finally {

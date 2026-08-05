@@ -3,7 +3,6 @@ import {
   Activity,
   Bot,
   Cable,
-  CheckCircle2,
   FileJson2,
   RadioTower,
   Settings2,
@@ -30,7 +29,6 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import { adapterAdminExtensions } from "@/extensions/adapter-admin-registry"
 import { useAdminResource } from "@/hooks/use-admin-resource"
 import { useAdmin } from "@/lib/admin-context"
 
@@ -45,7 +43,7 @@ export default function AdaptersConsole() {
       <PageHeader
         eyebrow="适配器"
         title="标准化消息通道"
-        description="Core 只读取 Adapter Manifest 和统一生命周期；协议表单由独立 Console 扩展注册。"
+        description="Core 只读取 Adapter Manifest 和统一生命周期；协议客户端由用户在外部接入。"
         action={<ReloadButton loading={resource.refreshing} onClick={() => void resource.reload()} />}
       />
       <AdminFeedback error={resource.error} notice={resource.notice} />
@@ -132,18 +130,13 @@ export default function AdaptersConsole() {
 
           <Card className="border-indigo-200 bg-indigo-50/40 shadow-none dark:border-indigo-900 dark:bg-indigo-950/20">
             <CardHeader>
-              <CardTitle className="flex items-center gap-2"><Cable className="size-4" /> Console 扩展</CardTitle>
-              <CardDescription>本地微信版本提供以下配置编辑器，Core Console 无需理解协议字段。</CardDescription>
+              <CardTitle className="flex items-center gap-2"><Cable className="size-4" /> 外部 Adapter</CardTitle>
+              <CardDescription>本项目不捆绑 wxhook、iPad 或其他平台客户端。</CardDescription>
             </CardHeader>
             <CardContent className="space-y-3">
-              {adapterAdminExtensions.map((extension) => (
-                <div key={extension.type} className="rounded-lg border bg-background/70 p-3">
-                  <p className="flex items-center gap-2 text-sm font-medium">
-                    <CheckCircle2 className="size-4 text-emerald-600" /> {extension.label}
-                  </p>
-                  <p className="mt-1 text-xs leading-5 text-muted-foreground">{extension.description}</p>
-                </div>
-              ))}
+              <p className="text-sm leading-6 text-muted-foreground">
+                你需要自行提供协议登录、事件转换、媒体处理、消息发送和健康检查，并通过 <code>PI_CHANNEL_ADAPTER_MODULE</code> 注册 Adapter 模块。
+              </p>
             </CardContent>
             <CardFooter>
               <Button asChild className="w-full">

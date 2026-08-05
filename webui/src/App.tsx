@@ -52,7 +52,7 @@ function LoginScreen({ onAuthenticated }: { onAuthenticated: (token: string) => 
             <span className="mb-3 flex size-11 items-center justify-center rounded-xl bg-primary text-primary-foreground">
               <KeyRound className="size-5" />
             </span>
-            <CardTitle>解锁 Pi WeChat Console</CardTitle>
+            <CardTitle>解锁 Pi Bot Console</CardTitle>
             <CardDescription>令牌仅保存在当前浏览器，用于访问本机 Admin API。</CardDescription>
           </CardHeader>
           <CardContent>

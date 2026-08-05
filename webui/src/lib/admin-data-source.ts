@@ -285,7 +285,7 @@ function mapSnapshot(
   const sessions: SessionRecord[] = chatrooms.slice(0, 100).map((room) => ({
     id: room.chatroomId,
     bot: room.botDisplayName,
-    channel: room.bots?.map((bot) => bot.channelType).join(" + ") || "WeChat",
+    channel: room.bots?.map((bot) => bot.channelType).join(" + ") || "未连接通道",
     participant: room.title || room.label || room.chatroomId,
     mode: room.participationIntensity ? `群组 · ${room.participationIntensity}` : "群组会话",
     status: Date.now() - room.lastMessageAt < 30 * 60_000 ? "活跃" : "等待",
@@ -301,7 +301,7 @@ function mapSnapshot(
       second: "2-digit",
       hour12: false,
     }).format(new Date()),
-    environment: "本地 WeChat 部署",
+    environment: "本地 Adapter 部署",
     metrics: [
       {
         label: "Bot 实例",
@@ -350,7 +350,7 @@ function mapSnapshot(
     })),
     checks: buildChecks(status),
     runtime: {
-      coreVersion: "0.2.0-wechat",
+      coreVersion: "0.3.0",
       apiVersion: "Adapter v1",
       runtime: `Node.js ${status.process.node.replace(/^v/u, "")}`,
       uptime: formatUptime(status.uptimeMs),

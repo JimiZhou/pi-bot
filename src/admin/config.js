@@ -13,7 +13,7 @@ export const DEFAULT_GLOBAL_SETTINGS = Object.freeze({
 export const DEFAULT_PERSONA_PROFILE = Object.freeze({
     id: "friendly-human-assistant",
     label: "友善真人助理",
-    prompt: `你是一个长期待在微信群里的友善真人感助理。你自然、真诚、有分寸，像熟悉群友的朋友，不像客服或说明书。
+    prompt: `你是一个长期待在聊天群里的友善真人感助理。你自然、真诚、有分寸，像熟悉群友的朋友，不像客服或说明书。
 
 交流原则：
 - 优先理解对方的情绪和真实意图，先接住情绪，再给有用回应。
@@ -258,8 +258,8 @@ function parseChatroomModelOverrides(value) {
     return value.map((item, index) => {
         const object = record(item, `chatroomModelOverrides[${index}]`);
         const chatroomId = text(object.chatroomId, `chatroomModelOverrides[${index}].chatroomId`, 1, 300);
-        if (!chatroomId.endsWith("@chatroom") || /\s|[\u0000-\u001f]/u.test(chatroomId)) {
-            throw new Error(`chatroomModelOverrides[${index}].chatroomId must be a WeChat @chatroom id`);
+        if (/\s|[\u0000-\u001f]/u.test(chatroomId)) {
+            throw new Error(`chatroomModelOverrides[${index}].chatroomId must be a conversation id`);
         }
         if (seen.has(chatroomId))
             throw new Error(`Duplicate chatroom override: ${chatroomId}`);
@@ -336,24 +336,15 @@ export function parseGlobalSettings(value) {
 }
 function parseChannelConfig(value) {
     const object = record(value, "channel config");
-    if (object.type === "wechat-ipad")
-        return parseWechatIpadChannelConfig(object);
-    if (object.type !== "wx-hook-http")
-        throw new Error("channel.type must be wx-hook-http or wechat-ipad");
+    const type = identifier(object.type, "channel.type", 128);
     const accountId = optionalText(object.accountId, "accountId", 1, 128);
+    const settings = object.settings === undefined ? {} : record(object.settings, "channel.settings");
+    if (Object.keys(settings).length > 100)
+        throw new Error("channel.settings cannot contain more than 100 keys");
     return {
-        type: "wx-hook-http",
-        gatewayBaseUrl: httpUrl(object.gatewayBaseUrl, "gatewayBaseUrl"),
-        apiTokenEnv: environmentName(object.apiTokenEnv, "apiTokenEnv"),
-        gatewayTimeoutMs: integer(object.gatewayTimeoutMs ?? 10_000, "gatewayTimeoutMs", 500, 120_000),
-        webhookHost: host(object.webhookHost ?? "0.0.0.0"),
-        webhookPort: integer(object.webhookPort, "webhookPort", 1024, 65_535),
-        webhookPath: webhookPath(object.webhookPath ?? "/wechat/events"),
-        webhookSecretEnv: environmentName(object.webhookSecretEnv, "webhookSecretEnv"),
+        type,
         ...(accountId ? { accountId } : {}),
-        acceptUnknownGroupSenders: booleanValue(object.acceptUnknownGroupSenders ?? true, "acceptUnknownGroupSenders"),
-        nativeQuoteReplies: booleanValue(object.nativeQuoteReplies ?? true, "nativeQuoteReplies"),
-        ingestRetryMs: integer(object.ingestRetryMs ?? 2000, "ingestRetryMs", 100, 60_000),
+        settings: cloneRecord(settings),
     };
 }
 function knowledgeProviderKind(value) {
@@ -367,31 +358,6 @@ function defaultKnowledgeBaseUrl(kind) {
     if (kind === "tavily")
         return "https://api.tavily.com/search";
     return "http://searxng:8080";
-}
-function parseWechatIpadChannelConfig(object) {
-    const accountId = optionalText(object.accountId, "accountId", 1, 128);
-    const apiTokenEnv = optionalEnvironmentName(object.apiTokenEnv, "apiTokenEnv");
-    const allowedSourceIps = stringArray(object.callbackAllowedSourceIps ?? ["172.23.0.0/16"], "callbackAllowedSourceIps", 32, 100);
-    if (allowedSourceIps.length === 0)
-        throw new Error("callbackAllowedSourceIps cannot be empty");
-    return {
-        type: "wechat-ipad",
-        apiBaseUrl: httpUrl(object.apiBaseUrl, "apiBaseUrl"),
-        accountWxid: nativeId(object.accountWxid, "accountWxid"),
-        ...(apiTokenEnv ? { apiTokenEnv } : {}),
-        apiTimeoutMs: integer(object.apiTimeoutMs ?? 35_000, "apiTimeoutMs", 500, 120_000),
-        callbackHost: networkHost(object.callbackHost ?? "0.0.0.0", "callbackHost"),
-        callbackPort: integer(object.callbackPort, "callbackPort", 1024, 65_535),
-        callbackPathPrefix: webhookPath(object.callbackPathPrefix ?? "/api/v1/wechat-client"),
-        callbackAllowedSourceIps: allowedSourceIps,
-        callbackMaxBodyBytes: integer(object.callbackMaxBodyBytes ?? 16 * 1024 * 1024, "callbackMaxBodyBytes", 1024, 128 * 1024 * 1024),
-        callbackRouterBaseUrl: httpUrl(object.callbackRouterBaseUrl, "callbackRouterBaseUrl"),
-        callbackAdvertiseHost: networkHost(object.callbackAdvertiseHost, "callbackAdvertiseHost"),
-        autoRegisterCallback: booleanValue(object.autoRegisterCallback ?? false, "autoRegisterCallback"),
-        registerIntervalMs: integer(object.registerIntervalMs ?? 60_000, "registerIntervalMs", 5000, 10 * 60_000),
-        ...(accountId ? { accountId } : {}),
-        ingestRetryMs: integer(object.ingestRetryMs ?? 2000, "ingestRetryMs", 100, 60_000),
-    };
 }
 function parseBotLimits(value) {
     const object = value === undefined ? {} : record(value, "bot limits");
@@ -420,6 +386,9 @@ function record(value, name) {
     if (typeof value !== "object" || value === null || Array.isArray(value))
         throw new Error(`${name} must be an object`);
     return value;
+}
+function cloneRecord(value) {
+    return JSON.parse(JSON.stringify(value));
 }
 function text(value, name, min, max) {
     if (typeof value !== "string")
@@ -558,31 +527,6 @@ function httpUrl(value, name) {
     if (url.username || url.password)
         throw new Error(`${name} cannot contain credentials`);
     return url.toString().replace(/\/$/, "");
-}
-function host(value) {
-    const normalized = text(value, "webhookHost", 1, 255);
-    if (!/^[a-zA-Z0-9:._-]+$/.test(normalized))
-        throw new Error("webhookHost is invalid");
-    return normalized;
-}
-function networkHost(value, name) {
-    const normalized = text(value, name, 1, 255);
-    if (!/^[a-zA-Z0-9:._-]+$/.test(normalized))
-        throw new Error(`${name} is invalid`);
-    return normalized;
-}
-function nativeId(value, name) {
-    const normalized = text(value, name, 1, 300);
-    if (/\s|[\u0000-\u001f]/u.test(normalized))
-        throw new Error(`${name} is invalid`);
-    return normalized;
-}
-function webhookPath(value) {
-    const normalized = text(value, "webhookPath", 1, 200);
-    if (!normalized.startsWith("/") || normalized.includes("?") || normalized.includes("#")) {
-        throw new Error("webhookPath must be an absolute path without query or fragment");
-    }
-    return normalized;
 }
 function relativeFile(value, name) {
     const normalized = text(value, name, 1, 300).replaceAll("\\", "/");

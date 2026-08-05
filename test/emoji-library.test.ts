@@ -7,6 +7,7 @@ import {
   collectInboundEmoji,
   createEmojiToolProvider,
   emojiToolRecommendation,
+  retryEmojiAnalysis,
 } from "../src/emoji-library.js";
 import type { InboundMessageEvent, MessagePart } from "../src/types.js";
 import { InMemoryEmojiRepository } from "./in-memory-emoji-repository.js";
@@ -59,8 +60,14 @@ test("normalized emoji images are deduplicated, labelled, and exposed as a send 
 
   const first = await collectInboundEmoji(event, options);
   const duplicate = await collectInboundEmoji({ ...event, id: "emoji-message-2" }, options);
+  const crossBotDuplicate = await collectInboundEmoji(
+    { ...event, id: "emoji-message-3" },
+    { ...options, botId: "bot-2" },
+  );
   assert.equal(first?.id, duplicate?.id);
+  assert.equal(first?.id, crossBotDuplicate?.id);
   assert.equal(visionCalls, 1);
+  assert.equal(store.listEmojis().length, 1);
   assert.equal(first?.status, "ready");
 
   const staged: MessagePart[] = [];
@@ -122,6 +129,43 @@ test("the initial catalog stays bounded and can search the complete repository",
   assert.match(text, new RegExp(targetId));
   await send.execute("send", { emojiId: targetId });
   assert.equal(staged[0]?.type, "image");
+});
+
+test("failed emoji analysis can recover from the durable asset later", async (context) => {
+  const directory = mkdtempSync(join(process.cwd(), ".pi-bot-emoji-retry-"));
+  context.after(() => rmSync(directory, { recursive: true, force: true }));
+  const store = new InMemoryEmojiRepository();
+  const assets = new LocalAssetStore({ directory });
+  const localAsset = await assets.put({
+    data: Buffer.from("GIF89a-retry"),
+    mimeType: "image/gif",
+    metadata: { kind: "emoji" },
+  });
+  const saved = store.saveCollectedEmoji({
+    botId: "bot-retry",
+    asset: localAsset,
+    sha256: localAsset.sha256!,
+    sourceConversationId: "group-retry",
+    sourceSenderId: "member-retry",
+    sourceMessageId: "message-retry",
+  }).emoji;
+  store.failEmojiAnalysis(saved.id, "quota exhausted");
+
+  const recovered = await retryEmojiAnalysis(store.getEmoji(saved.id)!, {
+    store,
+    assets,
+    visionProvider: {
+      async understand() {
+        return { text: "一只小猫挥手，适合打招呼" };
+      },
+    },
+    maxImageBytes: 1024,
+    timeoutMs: 1000,
+  });
+
+  assert.equal(recovered.status, "ready");
+  assert.equal(recovered.error, undefined);
+  assert.match(recovered.description, /小猫挥手/u);
 });
 
 async function* one(bytes: Uint8Array): AsyncIterable<Uint8Array> {

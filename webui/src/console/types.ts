@@ -3,7 +3,7 @@ import type { LucideIcon } from "lucide-react"
 
 import type { ConsoleSnapshot } from "@/types/console"
 
-export type ConsoleModuleGroup = "runtime" | "intelligence" | "conversations" | "wechat" | "system"
+export type ConsoleModuleGroup = "runtime" | "intelligence" | "conversations" | "system"
 
 export interface ConsoleModuleProps {
   snapshot: ConsoleSnapshot

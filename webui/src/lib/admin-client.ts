@@ -5,10 +5,13 @@ import type {
   BotConfig,
   ChatroomMemoryPayload,
   ChatroomRecord,
+  CustomMemeRecord,
   EmojiRecord,
   ConsoleManifest,
   GlobalSettings,
   KnowledgeProviderProfile,
+  MemeGenerationResult,
+  MemeInfo,
   McpServerProfile,
   ModelProfile,
   PersonaProfile,
@@ -86,6 +89,31 @@ export class AdminClient {
     )
   }
 
+  async emojiContent(id: string, signal?: AbortSignal): Promise<Blob> {
+    const response = await fetch(`/api/emojis/${encodeURIComponent(id)}/content`, {
+      signal,
+      headers: {
+        Accept: "image/*",
+        Authorization: `Bearer ${this.#token}`,
+      },
+    })
+    if (!response.ok) {
+      const contentType = response.headers.get("content-type") ?? ""
+      const payload = contentType.includes("application/json")
+        ? ((await response.json().catch(() => ({}))) as Record<string, unknown>)
+        : { message: await response.text().catch(() => "") }
+      throw new AdminApiError(
+        typeof payload.message === "string" && payload.message
+          ? payload.message
+          : `表情包预览加载失败（HTTP ${response.status}）`,
+        response.status,
+        typeof payload.error === "string" ? payload.error : "emoji_preview_failed",
+        payload.details,
+      )
+    }
+    return response.blob()
+  }
+
   chatroomMemories(botId: string, chatroomId: string) {
     return this.request<ChatroomMemoryPayload>(
       `/api/bots/${encodeURIComponent(botId)}/chatrooms/${encodeURIComponent(chatroomId)}/memories`,
@@ -131,6 +159,24 @@ export class AdminClient {
     })
   }
 
+  async bulkChatrooms(
+    targets: Array<{ botId: string; chatroomId: string }>,
+    pluginChanges: Record<string, boolean>,
+  ) {
+    let updated = 0
+    for (let index = 0; index < targets.length; index += 200) {
+      const result = await this.request<{ updated: number }>("/api/chatrooms/bulk", {
+        method: "PUT",
+        body: {
+          targets: targets.slice(index, index + 200),
+          pluginChanges,
+        },
+      })
+      updated += result.updated
+    }
+    return { updated }
+  }
+
   deleteChatroomOverride(botId: string, chatroomId: string) {
     return this.request<Record<string, unknown>>(
       `/api/bots/${encodeURIComponent(botId)}/chatrooms?chatroomId=${encodeURIComponent(chatroomId)}`,
@@ -160,6 +206,50 @@ export class AdminClient {
 
   emojis() {
     return this.request<{ emojis: EmojiRecord[] }>("/api/emojis")
+  }
+
+  memeKeys() {
+    return this.request<{ keys: string[] }>("/api/meme-generator/memes")
+  }
+
+  memeInfo(key: string) {
+    return this.request<MemeInfo>(`/api/meme-generator/memes/${encodeURIComponent(key)}/info`)
+  }
+
+  uploadCustomMeme(input: {
+    key: string
+    title?: string
+    keywords?: string[]
+    dataUrl: string
+  }) {
+    return this.request<{ meme: CustomMemeRecord }>("/api/meme-generator/custom", {
+      method: "POST",
+      body: input,
+    })
+  }
+
+  generateMeme(input: {
+    key: string
+    images: Array<{ mimeType: string; dataUrl: string }>
+    texts: string[]
+    args: Record<string, unknown>
+  }) {
+    return this.request<MemeGenerationResult>("/api/meme-generator/generate", {
+      method: "POST",
+      body: input,
+    })
+  }
+
+  saveMemeEmoji(input: {
+    botId: string
+    key: string
+    dataUrl: string
+    description?: string
+  }) {
+    return this.request<{ emoji: EmojiRecord }>("/api/meme-generator/save", {
+      method: "POST",
+      body: input,
+    })
   }
 
   updateEmoji(id: string, input: Partial<Pick<EmojiRecord, "description" | "enabled" | "isThinking">>) {
@@ -363,7 +453,7 @@ export class AdminClient {
       const adapters = await this.adapters()
       return {
         apiVersion: 1,
-        modules: ["core", "wechat"],
+        modules: ["core", "adapters"],
         adapters: adapters.manifests,
       }
     }
