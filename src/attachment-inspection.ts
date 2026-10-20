@@ -2,6 +2,7 @@ import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { MediaResolver } from "./asset-store.js";
 import type { InboundMessageEvent, MessagePart } from "./types.js";
+import type { SqliteStore } from "./sqlite-store.js";
 
 const TEXT_MIME = /^(?:text\/|application\/(?:json|xml|javascript|x-yaml|yaml|csv))/iu;
 
@@ -10,6 +11,37 @@ export interface CreateAttachmentInspectionToolOptions {
   mediaResolver: MediaResolver;
   maxBytes?: number;
   maxTextChars?: number;
+}
+
+/**
+ * Returns attachments on the current event plus attachments carried by a native
+ * quote/reply. The adapter may send the follow-up as text-only, so the original
+ * event must be recovered from the durable inbox.
+ */
+export function attachmentPartsForEvent(store: SqliteStore, event: InboundMessageEvent): MessagePart[] {
+  const parts: MessagePart[] = [...(event.parts ?? [])];
+  const messageIds = new Set<string>();
+  if (event.replyTo?.messageId) messageIds.add(event.replyTo.messageId);
+  if (event.replyTo?.transportMessageId) {
+    const quoted = store.getInboundMessageByTransportMessageId(event.conversation.id, event.replyTo.transportMessageId);
+    if (quoted?.id) messageIds.add(quoted.id);
+  }
+  for (const part of event.parts ?? []) {
+    if (part.type === "quote") messageIds.add(part.messageId);
+  }
+  for (const messageId of messageIds) {
+    const quoted = store.getInboundMessage(messageId);
+    if (quoted?.conversation.id !== event.conversation.id) continue;
+    parts.push(...(quoted.parts ?? []));
+  }
+  const seen = new Set<string>();
+  return parts.filter((part) => {
+    if (!isInspectablePart(part)) return false;
+    const key = part.type === "link" ? `link:${part.url}` : `${part.type}:${part.asset.id}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 /**

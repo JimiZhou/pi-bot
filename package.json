@@ -1,6 +1,6 @@
 {
   "name": "pi-bot",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A transport-independent, persistent, multimodal Pi-powered bot core",
   "type": "module",
   "main": "./dist/index.js",
@@ -18,17 +18,22 @@
       "types": "./dist/channel-adapter.d.ts",
       "import": "./dist/channel-adapter.js"
     },
+    "./plugins": {
+      "types": "./dist/plugins/index.d.ts",
+      "import": "./dist/plugins/index.js"
+    },
     "./media": {
       "types": "./dist/media.d.ts",
       "import": "./dist/media.js"
     },
-    "./plugins": {
-      "types": "./dist/plugins/index.d.ts",
-      "import": "./dist/plugins/index.js"
+    "./admin": {
+      "types": "./dist/admin/index.d.ts",
+      "import": "./dist/admin/index.js"
     }
   },
   "files": [
     "dist",
+    "webui",
     "README.md",
     "docs"
   ],
@@ -36,8 +41,11 @@
     "webui"
   ],
   "scripts": {
+    "start": "node dist/admin/main.js",
+    "start:webui": "node dist/admin/main.js",
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
-    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "build": "node scripts/build.mjs",
+    "build:typescript": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "TSX_DISABLE_CACHE=1 node --import tsx --test test/*.test.ts",
     "check": "npm run typecheck && npm test && npm run build && npm run webui:check",
@@ -52,7 +60,8 @@
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.74.2",
     "@earendil-works/pi-ai": "0.74.2",
-    "@modelcontextprotocol/sdk": "^1.30.0"
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@types/node": "24.3.0",

@@ -32,11 +32,20 @@ export interface KnowledgeProviderProfile {
 }
 
 export type McpAuthType = "none" | "bearer" | "api-key";
+export type McpTransport = "http" | "stdio";
 
 export interface McpServerProfile {
   id: string;
   label: string;
+  /** Defaults to http for profiles created before stdio support was added. */
+  transport: McpTransport;
   url: string;
+  command: string;
+  args: string[];
+  cwd?: string;
+  env: Record<string, string>;
+  /** Optional encrypted secret injection target for stdio servers. */
+  secretEnv?: string;
   authType: McpAuthType;
   authHeader: string;
   headers: Record<string, string>;

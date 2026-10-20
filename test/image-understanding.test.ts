@@ -27,6 +27,7 @@ import { SharedConversationState } from "../src/shared-conversation-state.js";
 import { SqliteStore } from "../src/sqlite-store.js";
 
 const PNG_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
+const GIF_BYTES = Buffer.from("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==", "base64");
 
 test("Pi image provider sends one bounded multimodal request", async () => {
   const faux = registerFauxProvider({
@@ -66,6 +67,63 @@ test("Pi image provider sends one bounded multimodal request", async () => {
   } finally {
     faux.unregister();
   }
+});
+
+test("direct Pi image provider converts GIFs before sending them to Gemini", async () => {
+  const faux = registerFauxProvider({
+    provider: uniqueProvider(),
+    models: [{ id: "vision-gif", input: ["text", "image"], maxTokens: 4096 }],
+  });
+  try {
+    faux.setResponses([
+      (context) => {
+        const message = context.messages[0] as UserMessage;
+        assert.ok(Array.isArray(message.content));
+        const image = message.content.find((item): item is ImageContent => item.type === "image");
+        assert.equal(image?.mimeType, "image/png");
+        assert.deepEqual([...Buffer.from(image!.data, "base64").subarray(0, 8)], [
+          0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+        ]);
+        return fauxAssistantMessage("GIF 已转换为 PNG。", { stopReason: "stop" });
+      },
+    ]);
+    const provider = new PiImageUnderstandingProvider({
+      model: faux.getModel(),
+      thinkingLevel: "minimal",
+      maxTokens: 300,
+    });
+    const result = await provider.understand({
+      asset: { id: "gif-direct", source: "platform", locator: "message:gif-direct" },
+      data: GIF_BYTES,
+      mimeType: "image/gif",
+      question: "图里有什么？",
+      conversationId: "room-1",
+      senderId: "user-1",
+      messageId: "message-gif-direct",
+    });
+    assert.equal(result.text, "GIF 已转换为 PNG。");
+  } finally {
+    faux.unregister();
+  }
+});
+
+test("GIF images are decoded to PNG before reaching the vision provider", async () => {
+  const provider = new RecordingVisionProvider();
+  const tool = createImageUnderstandingTool({
+    event: imageEvent("gif-image", "看看这个动图"),
+    mediaResolver: { resolve: async (asset) => resolved(asset, GIF_BYTES, { mimeType: "image/gif" }) },
+    provider,
+    trace() {},
+    maxCalls: 1,
+    maxImageBytes: 1024 * 1024,
+    maxEvidenceChars: 1000,
+    timeoutMs: 1000,
+  });
+  assert.ok(tool);
+  await tool.execute("gif", { imageIndex: 1, question: "图里有什么？" });
+  assert.equal(provider.requests.length, 1);
+  assert.equal(provider.requests[0]!.mimeType, "image/png");
+  assert.deepEqual([...provider.requests[0]!.data.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 });
 
 test("the image tool is absent without an image and never resolves media unless Pi calls it", async () => {
@@ -111,6 +169,8 @@ test("the image tool is absent without an image and never resolves media unless 
 
     await channel!.ingest(imageEvent("image-1", "随手发张图"));
     assert.equal(requests[1]!.tools.some((tool) => tool.name === "understand_image"), true);
+    assert.match(requests[1]!.prompt, /必须先调用它获取事实/u);
+    assert.doesNotMatch(requests[1]!.prompt, /当前回合没有可用的图片理解工具/u);
     assert.equal(resolves, 0);
     assert.equal(provider.requests.length, 0);
   } finally {
@@ -294,6 +354,65 @@ test("a recent image is not exposed when the current message does not refer to v
   }
 });
 
+test("a generic pronoun follow-up immediately after an image can inspect that image", async () => {
+  const provider = new RecordingVisionProvider("图中是一张桌面照片，屏幕上有一段文字。 OCR：项目已完成。 ");
+  const requests: AgentRunRequest[] = [];
+  let channel: ChannelPluginContext | undefined;
+  const core = new GroupAgentCore({
+    bot: { id: "bot-1", displayName: "小派" },
+    runner: {
+      async run(request) {
+        requests.push(request);
+        const tool = request.tools.find((item) => item.name === "understand_image");
+        assert.ok(tool);
+        const result = await tool.execute("implicit-follow-up", {
+          imageIndex: 1,
+          question: "分析下我在干什么？",
+        });
+        assert.match((result.content[0] as { text: string }).text, /项目已完成/u);
+        return { text: "你在看项目进度。" };
+      },
+    },
+    databasePath: ":memory:",
+    imageUnderstandingProvider: provider,
+    imageContextMessageLimit: 4,
+    imageContextWindowMs: 60_000,
+  });
+  const runtime = new ChannelRuntime({
+    core,
+    plugin: defineChannelPlugin({
+      apiVersion: CHANNEL_PLUGIN_API_VERSION,
+      id: "implicit-recent-image-channel",
+      features: [CHANNEL_FEATURE_RECEIVE_IMAGE],
+      capabilities: [
+        provideChannelCapability(MEDIA_RESOLVE_CAPABILITY, async ({ asset }) => resolved(asset, PNG_BYTES)),
+      ],
+      start(context) {
+        channel = context;
+      },
+      async send() {},
+      stop() {},
+    }),
+  });
+
+  try {
+    await runtime.start();
+    await channel!.ingest({
+      ...imageEvent("implicit-image", "", "implicit-recent-image-channel"),
+      conversation: { id: "adapter-a:room-1-group", kind: "group" },
+      mentions: [],
+    });
+    await channel!.ingest(groupTextEvent("implicit-question", "这个呢"));
+
+    assert.equal(requests.length, 1);
+    assert.equal(provider.requests.length, 1);
+    assert.equal(provider.requests[0]!.messageId, "implicit-image");
+  } finally {
+    if (runtime.running) await runtime.stop();
+    core.close();
+  }
+});
+
 test("a follow-up can inspect a recent group image after shared-state fusion", async () => {
   const provider = new RecordingVisionProvider("图中是一把扳手。");
   const shared = new SharedConversationState(":memory:");
@@ -394,6 +513,77 @@ test("a quoted image remains available even when recent-image history is disable
       replyTo: { messageId: "quoted-source", senderId: "user-1" },
     });
     assert.equal(provider.requests.at(-1)!.messageId, "quoted-source");
+  } finally {
+    if (runtime.running) await runtime.stop();
+    core.close();
+  }
+});
+
+test("a text follow-up can inspect an image quoted in the immediately preceding message", async () => {
+  const provider = new RecordingVisionProvider("图中是一个社交媒体主页。 ");
+  const requests: AgentRunRequest[] = [];
+  let channel: ChannelPluginContext | undefined;
+  let runs = 0;
+  const core = new GroupAgentCore({
+    bot: { id: "bot-1", displayName: "小派" },
+    runner: {
+      async run(request) {
+        runs += 1;
+        requests.push(request);
+        if (runs === 3) {
+          const tool = request.tools.find((item) => item.name === "understand_image");
+          assert.ok(tool);
+          assert.match(tool.description, /条消息前的图片/u);
+          await tool.execute("quoted-chain-image", { imageIndex: 1, question: "图片里是什么？" });
+        }
+        return { text: "收到" };
+      },
+    },
+    databasePath: ":memory:",
+    imageUnderstandingProvider: provider,
+    imageContextMessageLimit: 4,
+    imageContextWindowMs: 2_000,
+  });
+  const runtime = new ChannelRuntime({
+    core,
+    plugin: defineChannelPlugin({
+      apiVersion: CHANNEL_PLUGIN_API_VERSION,
+      id: "quoted-chain-image-channel",
+      features: [CHANNEL_FEATURE_RECEIVE_IMAGE],
+      capabilities: [
+        provideChannelCapability(MEDIA_RESOLVE_CAPABILITY, async ({ asset }) => resolved(asset, PNG_BYTES)),
+      ],
+      start(context) {
+        channel = context;
+      },
+      async send() {},
+      stop() {},
+    }),
+  });
+
+  try {
+    await runtime.start();
+    await channel!.ingest({
+      ...imageEvent("quoted-chain-source", "", "quoted-chain-image-channel"),
+      timestamp: 1_800_000_000_000,
+    });
+    await channel!.ingest({
+      ...directEvent("quoted-chain-reference", "@小派"),
+      timestamp: 1_800_000_001_000,
+      parts: [
+        { type: "text", text: "@小派" },
+        { type: "quote", messageId: "quoted-chain-source", senderId: "user-1" },
+      ],
+      replyTo: { messageId: "quoted-chain-source", senderId: "user-1" },
+    });
+    await channel!.ingest({
+      ...directEvent("quoted-chain-follow-up", "看看图片"),
+      timestamp: 1_800_000_002_000,
+    });
+
+    assert.equal(runs, 3);
+    assert.equal(provider.requests.length, 1);
+    assert.equal(provider.requests[0]!.messageId, "quoted-chain-source");
   } finally {
     if (runtime.running) await runtime.stop();
     core.close();

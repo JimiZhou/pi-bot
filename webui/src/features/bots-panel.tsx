@@ -4,10 +4,9 @@ import {
   Cable,
   ChevronRight,
   Clock3,
+  ExternalLink,
   MessageSquareText,
   MoreHorizontal,
-  Pause,
-  Play,
   Route,
   Settings2,
 } from "lucide-react"
@@ -28,7 +27,6 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { Label } from "@/components/ui/label"
@@ -122,14 +120,11 @@ export function BotsPanel({ bots }: { bots: BotProfile[] }) {
                     </Button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end">
-                    <DropdownMenuItem>
-                      <Play /> 重新启动
+                    <DropdownMenuItem asChild>
+                      <a href="#bots">
+                        <ExternalLink /> 在 Bot 模块管理
+                      </a>
                     </DropdownMenuItem>
-                    <DropdownMenuItem>
-                      <Pause /> 暂停运行
-                    </DropdownMenuItem>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuItem variant="destructive">删除 Bot</DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
               </CardAction>
@@ -164,7 +159,7 @@ export function BotsPanel({ bots }: { bots: BotProfile[] }) {
                 <div className="space-y-4 rounded-xl border p-4">
                   <div className="grid gap-2 sm:grid-cols-[10rem_1fr] sm:items-center">
                     <Label htmlFor="trigger-mode">触发策略</Label>
-                    <Select defaultValue="explicit">
+                    <Select defaultValue="explicit" disabled>
                       <SelectTrigger id="trigger-mode" className="w-full">
                         <SelectValue />
                       </SelectTrigger>
@@ -178,7 +173,7 @@ export function BotsPanel({ bots }: { bots: BotProfile[] }) {
                   <Separator />
                   <div className="grid gap-2 sm:grid-cols-[10rem_1fr] sm:items-center">
                     <Label htmlFor="context-policy">上下文策略</Label>
-                    <Select defaultValue="shared">
+                    <Select defaultValue="shared" disabled>
                       <SelectTrigger id="context-policy" className="w-full">
                         <SelectValue />
                       </SelectTrigger>
@@ -195,14 +190,19 @@ export function BotsPanel({ bots }: { bots: BotProfile[] }) {
                       <Label htmlFor="tool-confirmation">敏感工具二次确认</Label>
                       <p className="mt-1 text-xs text-muted-foreground">执行高影响操作前请求用户确认</p>
                     </div>
-                    <Switch id="tool-confirmation" defaultChecked />
+                    <Switch id="tool-confirmation" defaultChecked disabled />
                   </div>
                 </div>
               </div>
             </CardContent>
             <CardFooter className="justify-end gap-2">
-              <Button variant="outline">查看运行日志</Button>
-              <Button>保存配置</Button>
+              <span className="mr-auto text-xs text-muted-foreground">请在 Bot 模块管理完整配置</span>
+              <Button asChild>
+                <a href="#bots">
+                  在 Bot 模块修改
+                  <ExternalLink data-icon="inline-end" />
+                </a>
+              </Button>
             </CardFooter>
           </Card>
         ) : null}

@@ -11,7 +11,7 @@ export const BUILT_IN_PLUGIN_DEFINITIONS: readonly BuiltInPluginDefinition[] = O
   {
     type: "morning-brief",
     label: "晨报",
-    description: "按 Bot 的本地时间生成昨日群聊摘要、活跃排名和外部早报。",
+    description: "按 Bot 的本地时间向前一天活跃过的群发送简短早安问候。",
     defaultConfig: { id: "morning-brief", type: "morning-brief", enabled: false, settings: {} },
   },
   {
@@ -80,6 +80,23 @@ export const BUILT_IN_PLUGIN_DEFINITIONS: readonly BuiltInPluginDefinition[] = O
       settings: {
         timeoutSeconds: 8,
         maxResults: 1,
+      },
+    },
+  },
+  {
+    type: "meme-generator",
+    label: "表情包生成",
+    description: "通过 meme-generator 服务响应 meme 指令，生成并发送 GIF 或其他图片格式的表情包。",
+    defaultConfig: {
+      id: "meme-generator",
+      type: "meme-generator",
+      enabled: true,
+      settings: {
+        timeoutSeconds: 60,
+        maxResponseMb: 64,
+        maxInputMb: 20,
+        maxSendMb: 8,
+        maxImages: 6,
       },
     },
   },

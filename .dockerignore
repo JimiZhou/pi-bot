@@ -1,0 +1,9 @@
+.git
+.env
+data
+data.generated-*
+node_modules
+src-recovered
+deployment-backups
+/*.png
+/*.svg

@@ -36,7 +36,10 @@ export class RepeaterPlugin implements AgentPlugin {
     if (!candidate) return undefined;
     const recent = this.#context.core.listConversationMessages(event.conversation.id, { limit: 8 });
     const chain = this.#matchingTail(recent, candidate);
-    const collective = chain.length >= 1 && new Set([...chain.map((item) => item.senderId), event.sender.id]).size >= 2;
+    const collective = chain.length >= 1 && new Set([
+      ...chain.map((item) => canonicalIdentityId(item.senderId)),
+      canonicalIdentityId(event.sender.id),
+    ]).size >= 2;
     if (!collective) return undefined;
 
     const now = event.timestamp ?? Date.now();

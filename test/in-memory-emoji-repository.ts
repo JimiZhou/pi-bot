@@ -16,7 +16,7 @@ export class InMemoryEmojiRepository implements EmojiRepository {
     emoji: EmojiRecord;
     created: boolean;
   } {
-    const existing = this.listEmojis(input.botId).find((record) => record.sha256 === input.sha256);
+    const existing = this.listEmojis().find((record) => record.sha256 === input.sha256);
     if (existing) return { emoji: existing, created: false };
     const now = Date.now();
     const emoji: EmojiRecord = {

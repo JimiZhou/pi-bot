@@ -29,6 +29,9 @@ export interface PiAgentRunnerOptions {
 }
 
 const DEFAULT_TRANSIENT_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000] as const;
+// Keep image turns responsive too; the vision provider has its own short
+// per-model deadline before the external fallback gets a chance.
+const MIN_IMAGE_TOOL_ATTEMPT_TIMEOUT_MS = 15_000;
 
 export class PiAgentRunner implements AgentRunner {
   readonly #options: PiAgentRunnerOptions;
@@ -47,13 +50,18 @@ export class PiAgentRunner implements AgentRunner {
     }
     let silent = false;
     let toolExecutionStarted = false;
+    let sideEffectingToolExecutionStarted = false;
     let llmCalls = 0;
     let toolCalls = 0;
     let firstTokenAt: number | undefined;
+    let latestModelText: string | undefined;
     let budgetError: string | undefined;
     let attemptTimeoutError: string | undefined;
     const getApiKey = toApiKeyResolver(this.#options.apiKey);
     const attemptTimeoutMs = modelAttemptTimeout(this.#options.attemptTimeoutMs);
+    const effectiveAttemptTimeoutMs = request.tools.some((tool) => tool.name === "understand_image")
+      ? Math.max(attemptTimeoutMs ?? 0, MIN_IMAGE_TOOL_ATTEMPT_TIMEOUT_MS)
+      : attemptTimeoutMs;
     let agent!: Agent;
     const maxOutputTokens = this.#options.maxOutputTokens;
     agent = new Agent({
@@ -99,8 +107,24 @@ export class PiAgentRunner implements AgentRunner {
         event.assistantMessageEvent.type === "text_delta" &&
         firstTokenAt === undefined
       ) firstTokenAt = Date.now();
-      if (event.type === "tool_execution_start") toolExecutionStarted = true;
-      if (event.type === "tool_execution_start") toolCalls += 1;
+      if (event.type === "message_end" && isAssistantMessage(event.message)) {
+        const text = event.message.content
+          .filter((content): content is Extract<typeof content, { type: "text" }> => content.type === "text")
+          .map((content) => content.text)
+          .join("")
+          .trim();
+        latestModelText = text ? text.slice(0, 800) : undefined;
+      }
+      if (event.type === "tool_execution_start") {
+        toolExecutionStarted = true;
+        if (!isRetrySafeTool(event.toolName)) sideEffectingToolExecutionStarted = true;
+        toolCalls += 1;
+        request.onToolCallStart?.({
+          toolName: event.toolName,
+          args: event.args,
+          ...(latestModelText ? { modelText: latestModelText } : {}),
+        });
+      }
       if (event.type !== "tool_execution_end" || event.toolName !== "skip_reply" || event.isError) return;
       const details = (event.result as { details?: unknown } | undefined)?.details;
       if (isSilentDetails(details)) silent = true;
@@ -112,11 +136,11 @@ export class PiAgentRunner implements AgentRunner {
         ? boundedRequest.budget.deadlineAt! - Date.now()
         : Number.POSITIVE_INFINITY;
       if (remainingMs <= 0) throw new Error("Agent turn time budget exceeded");
-      const operationTimeoutMs = Math.min(remainingMs, attemptTimeoutMs ?? Number.POSITIVE_INFINITY);
+      const operationTimeoutMs = Math.min(remainingMs, effectiveAttemptTimeoutMs ?? Number.POSITIVE_INFINITY);
       if (Number.isFinite(operationTimeoutMs)) {
         timeout = setTimeout(() => {
-          if (attemptTimeoutMs !== undefined && attemptTimeoutMs < remainingMs) {
-            attemptTimeoutError = `Model attempt timed out after ${attemptTimeoutMs}ms`;
+          if (effectiveAttemptTimeoutMs !== undefined && effectiveAttemptTimeoutMs < remainingMs) {
+            attemptTimeoutError = `Model attempt timed out after ${effectiveAttemptTimeoutMs}ms`;
           } else {
             budgetError = `Agent turn time budget exceeded (${boundedRequest.budget!.timeoutMs}ms)`;
           }
@@ -138,12 +162,18 @@ export class PiAgentRunner implements AgentRunner {
     try {
       await runAgentOperation(() => agent.prompt(boundedRequest.prompt));
     } catch (error) {
-      if (attemptTimeoutError && this.#options.fallbackRunner && !toolExecutionStarted) {
-        this.#lastTransientError = attemptTimeoutError;
+      const errorText = error instanceof Error ? error.message : String(error);
+      const fallbackError = attemptTimeoutError ?? errorText;
+      if (
+        this.#options.fallbackRunner &&
+        !sideEffectingToolExecutionStarted &&
+        (attemptTimeoutError !== undefined || isTransientProviderError(errorText))
+      ) {
+        this.#lastTransientError = fallbackError;
         this.#primaryUnavailableUntil = Date.now() + circuitBreakerCooldown(this.#options.circuitBreakerCooldownMs);
         return this.#runFallback(
           boundedRequest,
-          attemptTimeoutError,
+          fallbackError,
           "primary-failed",
           collectTelemetry(
             agent.state.messages,
@@ -184,7 +214,7 @@ export class PiAgentRunner implements AgentRunner {
     }
     if (agent.state.errorMessage) {
       const error = agent.state.errorMessage;
-      if (this.#options.fallbackRunner && isTransientProviderError(error) && !toolExecutionStarted) {
+      if (this.#options.fallbackRunner && isTransientProviderError(error) && !sideEffectingToolExecutionStarted) {
         this.#lastTransientError = error;
         this.#primaryUnavailableUntil = Date.now() + circuitBreakerCooldown(this.#options.circuitBreakerCooldownMs);
         return this.#runFallback(
@@ -399,6 +429,10 @@ function modelAttemptTimeout(value: number | undefined): number | undefined {
     throw new Error("Pi model attempt timeout must be an integer between 1000 and 600000ms");
   }
   return value;
+}
+
+function isRetrySafeTool(toolName: string): boolean {
+  return toolName === "understand_image";
 }
 
 function delay(milliseconds: number): Promise<void> {

@@ -1,4 +1,6 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { MediaResolver } from "./asset-store.js";
+import type { SqliteStore } from "./sqlite-store.js";
 
 export type ConversationKind = "direct" | "group";
 export type GroupActivation = "mention" | "always" | "off";
@@ -313,6 +315,15 @@ export interface AgentRunRequest {
   sessionId: string;
   tools: AgentTool[];
   budget?: AgentRunBudget;
+  /** Called after the model has selected a tool and immediately before execution. */
+  onToolCallStart?: (context: AgentToolCallStart) => void;
+}
+
+export interface AgentToolCallStart {
+  toolName: string;
+  args: unknown;
+  /** Bounded natural-language lead-in emitted by the model before the tool call, if any. */
+  modelText?: string;
 }
 
 export interface AgentRunBudget {
@@ -354,6 +365,12 @@ export interface AgentRunner {
 export interface AgentToolProviderContext {
   event: InboundMessageEvent;
   stagePart(part: MessagePart): void;
+  /** Marks a bounded low-latency turn; providers should skip expensive catalog/index work. */
+  fastTurn?: boolean;
+  /** Resolver owned by the active channel; it can read platform attachments for this turn. */
+  mediaResolver?: MediaResolver;
+  /** The active bot's durable store; providers must not substitute the admin control-plane store. */
+  store?: SqliteStore;
 }
 
 /** Explicit allowlist seam for app- or channel-specific Pi tools. */

@@ -1,0 +1,54 @@
+services:
+  pi-wechat-agent:
+    container_name: pi-wechat-agent
+    build: .
+    image: pi-wechat-agent:latest
+    init: true
+    restart: unless-stopped
+    user: "${PI_UID:-1000}:${PI_GID:-1000}"
+    environment:
+      NODE_ENV: production
+      TZ: Asia/Shanghai
+      PI_AGENT_DATA_DIR: /app/data
+      PI_WEBUI_HOST: 0.0.0.0
+      PI_WEBUI_PORT: 8787
+      PI_WEBUI_ALLOW_PUBLIC: "${PI_WEBUI_ALLOW_PUBLIC:-false}"
+      PI_FALLBACK_NOTIFY_USER: "${PI_FALLBACK_NOTIFY_USER:-}"
+      PI_ADMIN_TOKEN: "${PI_ADMIN_TOKEN:-}"
+      PI_CHANNEL_ADAPTER_MODULE: "${PI_CHANNEL_ADAPTER_MODULE:-}"
+      PI_GATEWAY_HEALTH_INTERVAL_MS: "${PI_GATEWAY_HEALTH_INTERVAL_MS:-30000}"
+      PI_GROUP_MEMBER_REFRESH_ENABLED: "${PI_GROUP_MEMBER_REFRESH_ENABLED:-false}"
+      PI_GROUP_MEMBER_REFRESH_INTERVAL_MS: "${PI_GROUP_MEMBER_REFRESH_INTERVAL_MS:-43200000}"
+      PI_FUSION_BOOTSTRAP: "${PI_FUSION_BOOTSTRAP:-false}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      GOOGLE_GENERATIVE_AI_API_KEY: "${GOOGLE_GENERATIVE_AI_API_KEY:-}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      PI_TTS_API_BASE_URL: "${PI_TTS_API_BASE_URL:-http://tts-api:8880}"
+      PI_TTS_API_KEY: "${PI_TTS_API_KEY:-}"
+      PI_TTS_API_EDGE_VOICE: "${PI_TTS_API_EDGE_VOICE:-zh-CN-XiaoxiaoNeural}"
+      PI_TTS_API_KOKORO_VOICE: "${PI_TTS_API_KOKORO_VOICE:-zf_xiaoxiao}"
+      PI_TTS_API_SPEED: "${PI_TTS_API_SPEED:-1}"
+      PI_GEMINI_TTS_ENABLED: "${PI_GEMINI_TTS_ENABLED:-true}"
+      PI_MEME_API_BASE_URL: "${PI_MEME_API_BASE_URL:-http://meme-generator:2233}"
+      PI_AGENT_ENABLE_SHELL: "${PI_AGENT_ENABLE_SHELL:-true}"
+      PI_AGENT_PYTHON_COMMAND: "${PI_AGENT_PYTHON_COMMAND:-python3}"
+      PI_BROWSER_CDP_URL: "${PI_BROWSER_CDP_URL:-}"
+    volumes:
+      - ./data:/app/data
+      - ./adapters:/app/adapters:ro
+    ports:
+      - "${PI_LAN_IP:-127.0.0.1}:8787:8787"
+
+  meme-generator:
+    container_name: meme-generator
+    image: meetwq/meme-generator:latest
+    restart: unless-stopped
+    environment:
+      MEME_DIRS: '["/data/memes"]'
+      GIF_MAX_SIZE: "${MEME_GENERATOR_GIF_MAX_SIZE:-8.0}"
+      GIF_MAX_FRAMES: "${MEME_GENERATOR_GIF_MAX_FRAMES:-100}"
+    volumes:
+      - ./data/meme-generator:/data
+    expose:
+      - "2233"

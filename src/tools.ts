@@ -2,6 +2,7 @@ import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { replaceTransportIds, safeGroupDisplayName } from "./display-name.js";
 import { SqliteStore } from "./sqlite-store.js";
+import { formatBeijingTimestamp } from "./time.js";
 import type { InboundMessageEvent, KnowledgeItem, KnowledgeRetriever, TraceListener } from "./types.js";
 
 const MemoryParameters = Type.Object({
@@ -213,7 +214,7 @@ export function createCoreTools(options: CoreToolsOptions): AgentTool[] {
         matches.length === 0
           ? "没有找到匹配的历史消息。"
           : matches
-              .map((message) => `[${new Date(message.timestamp).toISOString()}] ${safeGroupDisplayName(
+              .map((message) => `[${formatBeijingTimestamp(message.timestamp)}] ${safeGroupDisplayName(
                 message.senderName,
                 message.senderId,
                 message.direction === "outbound" ? "机器人" : "群友",
@@ -289,7 +290,7 @@ function formatKnowledge(items: KnowledgeItem[], maxChars: number): string {
   for (const [index, item] of items.entries()) {
     const updatedAt =
       item.updatedAt !== undefined && Number.isSafeInteger(item.updatedAt) && item.updatedAt >= 0
-        ? `\n更新时间: ${new Date(item.updatedAt).toISOString()}`
+        ? `\n更新时间: ${formatBeijingTimestamp(item.updatedAt)}`
         : "";
     const section = `[证据 ${index + 1}] ${item.title}\n来源: ${item.source ?? "未标注"}${updatedAt}\n内容: ${item.content.trim()}`;
     const separatorLength = sections.length === 0 ? 0 : 2;

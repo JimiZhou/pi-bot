@@ -7,7 +7,6 @@ import {
   FileJson2,
   MoreHorizontal,
   RadioTower,
-  RefreshCw,
   TerminalSquare,
 } from "lucide-react"
 
@@ -43,7 +42,7 @@ import type { AdapterInstance } from "@/types/console"
 const adapterIcons = [RadioTower, Cable, TerminalSquare]
 
 const contractRows = [
-  { field: "manifest.id", required: "必需", description: "全局唯一的适配器标识" },
+  { field: "manifest.type", required: "必需", description: "全局唯一的适配器类型标识" },
   { field: "apiVersion", required: "必需", description: "核心兼容版本，用于协商行为" },
   { field: "capabilities", required: "必需", description: "入站、出站与媒体能力声明" },
   { field: "limits", required: "可选", description: "消息长度、速率与资源约束" },
@@ -84,11 +83,11 @@ export function AdaptersPanel({ adapters }: { adapters: AdapterInstance[] }) {
                       </Button>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end">
-                      <DropdownMenuItem>
-                        <RefreshCw /> 重新同步能力
+                      <DropdownMenuItem asChild>
+                        <a href="#bots">
+                          <ArrowUpRight /> 在 Bot 模块管理
+                        </a>
                       </DropdownMenuItem>
-                      <DropdownMenuItem>编辑连接配置</DropdownMenuItem>
-                      <DropdownMenuItem>查看事件日志</DropdownMenuItem>
                     </DropdownMenuContent>
                   </DropdownMenu>
                 </CardAction>
@@ -177,9 +176,11 @@ export function AdaptersPanel({ adapters }: { adapters: AdapterInstance[] }) {
             ))}
           </CardContent>
           <CardFooter className="border-indigo-200 bg-indigo-100/60 dark:border-indigo-900 dark:bg-indigo-900/30">
-            <Button variant="outline" className="w-full justify-between bg-background">
-              查看开发文档
+            <Button variant="outline" className="w-full justify-between bg-background" asChild>
+              <a href="#bots">
+              查看适配器配置
               <ArrowUpRight data-icon="inline-end" />
+              </a>
             </Button>
           </CardFooter>
         </Card>

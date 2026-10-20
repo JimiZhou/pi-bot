@@ -8,12 +8,48 @@ import { createEmojiToolProvider } from "../src/emoji-library.js";
 import { InMemoryEmojiRepository } from "./in-memory-emoji-repository.js";
 import {
   GroupAgentCore,
+  SharedConversationState,
   type GroupAgentCoreOptions,
   type AgentRunner,
   type AgentRunRequest,
   type AgentRunResult,
   type InboundMessageEvent,
 } from "../src/index.js";
+
+test("proactive emoji replies are visible in shared group history", async (context) => {
+  const directory = mkdtempSync(join(process.cwd(), ".pi-bot-shared-emoji-"));
+  const shared = new SharedConversationState(join(directory, "shared.sqlite"));
+  const core = new GroupAgentCore({
+    bot: { id: "bot-1", displayName: "小派" },
+    runner: new RecordingRunner(),
+    databasePath: join(directory, "agent.sqlite"),
+    sharedConversationState: shared,
+  });
+  context.after(() => {
+    core.close();
+    shared.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  await core.receive(groupMessage("seed-emoji-history", "member", "群友", "普通群消息", {
+    conversation: { id: "room-group", kind: "group" },
+  }));
+  await core.sendProactiveMessage({
+    id: "proactive:emoji-history",
+    kind: "admin-message",
+    conversationId: "room-group",
+    prompt: "管理员发送表情",
+    timestamp: Date.now(),
+  }, "", [{
+    type: "image",
+    asset: { id: "emoji", source: "local", locator: "aa/emoji.gif" },
+    alt: "小猫点头",
+  }]);
+
+  const outbound = shared.store.listConversationMessages("room-group", { limit: 10 })
+    .find((message) => message.direction === "outbound");
+  assert.equal(outbound?.text, "[图片: 小猫点头]");
+});
 
 class RecordingRunner implements AgentRunner {
   readonly requests: AgentRunRequest[] = [];
@@ -835,6 +871,42 @@ test("high-value person memory is injected without another model call", async (c
   assert.equal(fixture.runner.calls, 1);
 });
 
+test("shared group memory survives adapter-prefixed room ids", async (context) => {
+  const directory = mkdtempSync(join(process.cwd(), ".pi-bot-shared-memory-"));
+  const shared = new SharedConversationState(join(directory, "shared.sqlite"), {
+    conversationIdResolver: (value) => value.normalize("NFKC").trim().toLocaleLowerCase().split(":").at(-1) ?? value,
+    identityIdResolver: (value) => value.normalize("NFKC").trim().toLocaleLowerCase().split(":").at(-1) ?? value,
+  });
+  const runner = new RecordingRunner();
+  const core = new GroupAgentCore({
+    bot: { id: "bot-1", displayName: "小派" },
+    runner,
+    databasePath: join(directory, "agent.sqlite"),
+    sharedConversationState: shared,
+  });
+  shared.store.remember({
+    scope: "conversation",
+    scopeId: "room@chatroom",
+    conversationId: "room@chatroom",
+    kind: "fact",
+    content: "群友以前经营过一家书店。",
+    importance: 0.9,
+  });
+  context.after(() => {
+    core.close();
+    shared.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  await core.receive({
+    ...groupMessage("prefixed-memory", "adapter:user-1", "群友", "小派，群友以前经营什么店？", {
+      conversation: { id: "adapter:room@chatroom", kind: "group", title: "测试群" },
+      mentions: [{ id: "bot-1" }],
+    }),
+  });
+  assert.match(runner.requests[0]!.prompt, /群友以前经营过一家书店/u);
+});
+
 test("semantic embeddings recall a related memory without shared keywords", async (context) => {
   const fixture = createFixture(context, new RecordingRunner(), {
     memoryLimit: 1,
@@ -1105,6 +1177,23 @@ test("framework APIs reach Pi only through explicit named tool providers", async
   }));
   assert.equal(runner.requests[0]!.tools.some((tool) => tool.name === "channel_list_group_members"), true);
   assert.equal(runner.requests[0]!.tools.some((tool) => tool.name === "invoke_raw_channel_api"), false);
+});
+
+test("fast turns tell providers to skip expensive optional work", async (context) => {
+  const runner = new RecordingRunner();
+  let fastTurn: boolean | undefined;
+  const fixture = createFixture(context, runner, {
+    fastTurnResolver: () => true,
+    toolProviders: [({ fastTurn: currentFastTurn }) => {
+      fastTurn = currentFastTurn;
+      return [];
+    }],
+  });
+
+  await fixture.core.receive(groupMessage("fast-provider", "u1", "阿青", "小派，在吗？", {
+    mentions: [{ id: "bot-1" }],
+  }));
+  assert.equal(fastTurn, true);
 });
 
 test("media parts survive a process restart in the durable outbox", async (context) => {

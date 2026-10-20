@@ -43,6 +43,7 @@ function isPlaceholderDisplayName(value: string): boolean {
 function isReadableIdentity(value: string): boolean {
   const normalized = value.normalize("NFKC").trim();
   if (!normalized || [...normalized].length > 80) return false;
+  if (/^[a-z]{2,8}[_:-][a-z\d_-]{3,}$/iu.test(normalized)) return false;
   if (/[@:\\/]|\s{2,}/u.test(normalized)) return false;
   if (/^[a-f\d]{20,}$/iu.test(normalized)) return false;
   return !/^[a-z\d_-]{24,}$/iu.test(normalized);

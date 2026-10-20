@@ -4,6 +4,7 @@ import {
   AgentPluginRegistry,
   GroupEventNotifyPlugin,
   GroupSummaryPlugin,
+  MorningBriefPlugin,
   PatReplyPlugin,
   PersonaCommandPlugin,
   SuxunMorningNewsSource,
@@ -30,6 +31,49 @@ test("morning news source is bounded and keeps only source-labelled text", async
     source: "https://news.example.test",
   });
   assert.equal("image" in result, false);
+});
+
+test("morning brief only sends a greeting without reading or summarizing group activity", async () => {
+  const requests: Array<{ prompt: string; conversationId: string }> = [];
+  const sent: string[] = [];
+  const plugin = new MorningBriefPlugin({
+    id: "morning-brief",
+    type: "morning-brief",
+    enabled: true,
+    settings: { minute: 7 * 60 + 15, activeGroupMinMessages: 5 },
+  }, {
+    timezoneOffsetMinutes: 480,
+    isEnabledForConversation: () => true,
+    claim: () => true,
+    releaseClaim: () => true,
+    core: {
+      listGroupActivity: () => [{
+        conversationId: "room-group",
+        inboundMessages: 8,
+        activeMembers: 3,
+        lastMessageAt: Date.now(),
+      }],
+      getGroupActivityDigest: () => {
+        throw new Error("morning brief must not load a group digest");
+      },
+    },
+    runtime: {
+      sendProactiveText: async (request: { prompt: string; conversationId: string }, text: string) => {
+        requests.push({ prompt: request.prompt, conversationId: request.conversationId });
+        sent.push(text);
+        return { handling: { status: "replied" }, delivery: { delivered: ["message-1"] } };
+      },
+    },
+    log: () => undefined,
+  } as never);
+
+  await plugin.tick(Date.UTC(2026, 6, 21, 23, 15));
+
+  assert.deepEqual(requests, [{
+    conversationId: "room-group",
+    prompt: "这是每日早安问候任务。只发送一句简短自然的早安，不总结昨日聊天，不列活跃排名，不发送新闻。",
+  }]);
+  assert.deepEqual(sent, ["早安，大家！新的一天顺顺利利，心情愉快～"]);
 });
 
 test("persona commands require an explicit mention and switch only the current group", () => {

@@ -109,6 +109,8 @@ export interface ConsoleSnapshot {
   environment: string
   metrics: ConsoleMetric[]
   volume: number[]
+  volumeLabels?: string[]
+  volumeCounts?: number[]
   bots: BotProfile[]
   adapters: AdapterInstance[]
   modelRoutes: ModelRoute[]

@@ -101,6 +101,10 @@ export {
   magnetCodeSearchPluginFactory,
   parseCatalogCode,
   searchMagnets,
+  MemeGeneratorPlugin,
+  memeGeneratorPluginFactory,
+  parseMemeCommand,
+  compressForChat,
   ScheduledTaskPlugin,
   createScheduledTaskToolProvider,
   isScheduledTaskIntent,
@@ -122,8 +126,16 @@ export {
   type EmojiStatus,
   type EmojiToolOptions,
 } from "./emoji-library.js";
-export { SharedConversationState, fusedMessageId } from "./shared-conversation-state.js";
-export { canonicalIdentity, replaceTransportIds, safeGroupDisplayName } from "./display-name.js";
+export {
+  SharedConversationState,
+  fusedMessageId,
+  type SharedConversationStateOptions,
+} from "./shared-conversation-state.js";
+export {
+  canonicalIdentity,
+  replaceTransportIds,
+  safeGroupDisplayName,
+} from "./display-name.js";
 export {
   nextScheduledTaskRun,
   scheduledTaskMinute,
@@ -167,6 +179,7 @@ export type {
   KnowledgeProviderProfile,
   McpAuthType,
   McpServerProfile,
+  McpTransport,
   PersonaProfile,
 } from "./config.js";
 export { HttpKnowledgeRetriever, probeKnowledgeProvider } from "./knowledge-retriever.js";
@@ -225,3 +238,23 @@ export type {
   TriggerDecision,
   TriggerPolicy,
 } from "./types.js";
+
+export {
+  AdminStore,
+  AdminServer,
+  probeProvider,
+  AgentSupervisor,
+} from "./admin/index.js";
+export {
+  DEFAULT_BOT_LIMITS,
+  DEFAULT_GLOBAL_SETTINGS,
+  DEFAULT_PERSONA_PROFILE,
+  DEFAULT_SOCIAL_SCHEDULE,
+  parseBotConfig,
+  parseGlobalSettings,
+  parseKnowledgeProviderProfile,
+  parseMcpServerProfile,
+  parseModelProfile,
+  parsePersonaProfile,
+  parseProviderProfile,
+} from "./admin/config.js";

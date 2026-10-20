@@ -1,6 +1,6 @@
 import { KeyedQueue } from "./keyed-queue.js";
 import type { MediaResolver } from "./asset-store.js";
-import { createAttachmentInspectionTool } from "./attachment-inspection.js";
+import { attachmentPartsForEvent, createAttachmentInspectionTool } from "./attachment-inspection.js";
 import {
   createImageUnderstandingTool,
   type ImageUnderstandingCandidate,
@@ -14,6 +14,7 @@ import { replaceTransportIds, safeGroupDisplayName } from "./display-name.js";
 import { emojiToolRecommendation } from "./emoji-library.js";
 import { preferredVoiceReplyMode, WHISPER_TTS_STYLE, type ConversationVoiceMode } from "./reply-modality.js";
 import { createCoreTools } from "./tools.js";
+import { formatBeijingTimestamp } from "./time.js";
 import { SocialTriggerPolicy } from "./trigger.js";
 import { extractSearchTerms } from "./search-terms.js";
 import { toChatPlainText } from "./chat-text.js";
@@ -21,6 +22,7 @@ import type {
   AgentRunner,
   AgentRunRequest,
   AgentRunResult,
+  AgentToolCallStart,
   AgentToolProvider,
   BotIdentity,
   GroupActivation,
@@ -55,6 +57,8 @@ export interface GroupAgentCoreOptions {
   ) => Partial<Pick<BotIdentity, "displayName" | "wakeWords">> | undefined;
   runner: AgentRunner;
   runnerResolver?: (event: InboundMessageEvent) => AgentRunner;
+  /** Marks short, low-risk turns that may use a smaller prompt/tool surface. */
+  fastTurnResolver?: (event: InboundMessageEvent) => boolean;
   /** Cheap runner used only for the JSON-only participation judge; falls back to the chat runner. */
   participationJudgeRunner?: AgentRunner;
   /** Local runner used to choose a semantic emoji response without invoking the commercial chat model. */
@@ -111,7 +115,9 @@ export interface GroupAgentCoreOptions {
   responseGateRelease?: (event: InboundMessageEvent, reason: string) => void | Promise<void>;
   /** Optional Gemini semantic memory index layered over the local exact-term search. */
   memoryEmbeddingProvider?: MemoryEmbeddingProvider;
-  /** Starts optional ephemeral feedback while the main model is still running. Return a cleanup callback. */
+  /** Starts optional ephemeral feedback after the model has selected a long-running tool. */
+  toolCallFeedback?: (context: ToolCallFeedbackContext) => void;
+  /** @deprecated Use toolCallFeedback; retained for embedding compatibility. */
   pendingFeedback?: (context: PendingFeedbackContext) => void | (() => void);
   /** Persistent user-controlled reply modality, stored outside the model transcript. */
   voiceModeResolver?: (event: InboundMessageEvent) => ConversationVoiceMode;
@@ -137,6 +143,11 @@ export interface PendingFeedbackContext {
   recentMessages: readonly StoredMessage[];
 }
 
+export interface ToolCallFeedbackContext extends AgentToolCallStart {
+  event: InboundMessageEvent;
+  triggerReason: string;
+}
+
 export interface AgentReceiveContext {
   /** Supplied by ChannelRuntime only for the plugin that owns this inbound event. */
   mediaResolver?: MediaResolver;
@@ -147,6 +158,7 @@ export class GroupAgentCore {
   readonly #botIdentityResolver: GroupAgentCoreOptions["botIdentityResolver"];
   readonly #runner: AgentRunner;
   readonly #runnerResolver: ((event: InboundMessageEvent) => AgentRunner) | undefined;
+  readonly #fastTurnResolver: ((event: InboundMessageEvent) => boolean) | undefined;
   readonly #participationJudgeRunner: AgentRunner | undefined;
   readonly #emojiBattleRunner: AgentRunner | undefined;
   readonly #identityAliasesResolver: ((event: InboundMessageEvent) => string[]) | undefined;
@@ -191,7 +203,7 @@ export class GroupAgentCore {
   readonly #responseGate: GroupAgentCoreOptions["responseGate"];
   readonly #responseGateRelease: GroupAgentCoreOptions["responseGateRelease"];
   readonly #memoryEmbeddingProvider: MemoryEmbeddingProvider | undefined;
-  readonly #pendingFeedback: GroupAgentCoreOptions["pendingFeedback"];
+  readonly #toolCallFeedback: GroupAgentCoreOptions["toolCallFeedback"];
   readonly #voiceModeResolver: GroupAgentCoreOptions["voiceModeResolver"];
   /** Per-conversation judge throttle: negative verdicts back off exponentially. */
   readonly #judgeState = new Map<string, { until: number; misses: number }>();
@@ -205,6 +217,7 @@ export class GroupAgentCore {
     this.#botIdentityResolver = options.botIdentityResolver;
     this.#runner = options.runner;
     this.#runnerResolver = options.runnerResolver;
+    this.#fastTurnResolver = options.fastTurnResolver;
     this.#participationJudgeRunner = options.participationJudgeRunner;
     this.#emojiBattleRunner = options.emojiBattleRunner;
     this.#identityAliasesResolver = options.identityAliasesResolver;
@@ -286,7 +299,7 @@ export class GroupAgentCore {
     this.#responseGate = options.responseGate;
     this.#responseGateRelease = options.responseGateRelease;
     this.#memoryEmbeddingProvider = options.memoryEmbeddingProvider;
-    this.#pendingFeedback = options.pendingFeedback;
+    this.#toolCallFeedback = options.toolCallFeedback;
     this.#voiceModeResolver = options.voiceModeResolver;
   }
 
@@ -587,6 +600,7 @@ export class GroupAgentCore {
       !baseDecision.respond &&
       (baseDecision.reason === "ambient-no-signal" || baseDecision.reason === "not-addressed") &&
       autoParticipationAllowed &&
+      this.#participationJudgeRunner &&
       this.#judgeCooldownExpired(event) &&
       recentConversationThread(triggerMessages, this.#bot.id, event.timestamp ?? Date.now(), this.#continuationWindowMs)
     ) {
@@ -677,7 +691,8 @@ export class GroupAgentCore {
       this.#continuationWindowMs,
     );
     if (!thread) return { respond: false, reason: "ambient-no-signal" };
-    const runner = this.#participationJudgeRunner ?? this.#runnerResolver?.(event) ?? this.#runner;
+    const runner = this.#participationJudgeRunner;
+    if (!runner) return { respond: false, reason: "ambient-no-signal" };
     const transcript = [...thread.slice(-6), {
       sequence: Number.MAX_SAFE_INTEGER,
       id: event.id,
@@ -694,56 +709,19 @@ export class GroupAgentCore {
     }));
     const result = await runner.run({
       systemPrompt: participationJudgeSystemPrompt(intensity),
-      prompt: `${JSON.stringify({
-        recentConversation: transcript,
+      prompt: JSON.stringify({
+        // Keep the schema before the changing transcript so Gemini's implicit
+        // prompt cache can reuse the largest possible prefix.
         outputSchema: {
           decision: "speak | silent",
           reason: "followup | correction | new_info | ack_only | human_to_human | topic_shift | no_value | uncertain",
           confidence: "number between 0 and 1",
         },
-        participationIntensity: intensity,
-        rules: [
-          "speak 只能搭配 followup、correction 或 new_info",
-          "silent 只能搭配 ack_only、human_to_human、topic_shift、no_value 或 uncertain",
-          "不确定当前消息是不是在对机器人说时选择 silent/uncertain",
-          "不要因为关键词相似就认定同一话题，要结合说话人和语义关系",
-        ],
-        examples: [
-          {
-            conversation: ["群友：球场从哪边走？", "机器人：从东门走最近。", "另一群友：东门出来就是那条小路吧？"],
-            output: { decision: "speak", reason: "followup", confidence: 0.9 },
-          },
-          {
-            conversation: ["机器人：活动九点开始。", "群友：通知刚改成十点了，你再确认下。"],
-            output: { decision: "speak", reason: "correction", confidence: 0.94 },
-          },
-          {
-            conversation: ["机器人：代理已经恢复。", "群友：那现在延迟大概多少？"],
-            output: { decision: "speak", reason: "followup", confidence: 0.95 },
-          },
-          {
-            conversation: ["机器人：文件已经发群里了。", "群友：好的，谢谢。"],
-            output: { decision: "silent", reason: "ack_only", confidence: 0.97 },
-          },
-          {
-            conversation: ["机器人：明天可能下雨。", "群友甲：老林，你明天有空吗？"],
-            output: { decision: "silent", reason: "human_to_human", confidence: 0.96 },
-          },
-          {
-            conversation: ["机器人：网络恢复了。", "群友：今晚吃什么？"],
-            output: { decision: "silent", reason: "topic_shift", confidence: 0.98 },
-          },
-          {
-            conversation: ["机器人：这个版本已经修好健康检查。", "群友：确实。"],
-            output: { decision: "silent", reason: "no_value", confidence: 0.92 },
-          },
-          {
-            conversation: ["机器人：可以从设置里打开。", "群友：那边呢？"],
-            output: { decision: "silent", reason: "uncertain", confidence: 0.64 },
-          },
-        ],
-      })}`,
-      sessionId: `participation-judge:${event.conversation.id}:${event.id}`,
+        recentConversation: transcript,
+      }),
+      // Keep the provider affinity key stable for this Bot and room. The
+      // transcript is already the changing suffix of the prompt.
+      sessionId: `participation-judge:${this.#sessionNamespace}:${event.conversation.id}:intensity:${intensity}`,
       tools: [],
       budget: { maxLlmCalls: 1, maxToolCalls: 0, timeoutMs: 20_000 },
     });
@@ -974,6 +952,7 @@ export class GroupAgentCore {
     // the event text; recent history and memory recall would only duplicate it.
     const digestTurn = event.metadata?.proactiveKind === "morning-brief" ||
       event.metadata?.proactiveKind === "group-summary";
+    const fastTurn = this.#fastTurnResolver?.(event) === true;
     const contextMessages = digestTurn
       ? []
       : event.conversation.kind === "group"
@@ -981,7 +960,9 @@ export class GroupAgentCore {
         : triggerMessages;
     const recentMessages = fitRecentMessages(
       contextMessages,
-      event.conversation.kind === "group" ? Math.min(this.#maxHistoryChars, 6_000) : this.#maxHistoryChars,
+      fastTurn
+        ? Math.min(this.#maxHistoryChars, event.conversation.kind === "group" ? 2_400 : 3_000)
+        : event.conversation.kind === "group" ? Math.min(this.#maxHistoryChars, 6_000) : this.#maxHistoryChars,
     );
     const startedAt = Date.now();
     const contextReset = this.conversationContextReset(event.conversation.id);
@@ -1001,12 +982,6 @@ export class GroupAgentCore {
       sessionScope,
       contextEpoch,
     });
-    const stopPendingFeedback = this.#pendingFeedback?.({
-      event,
-      triggerReason,
-      recentMessages: triggerMessages,
-    });
-
     try {
       const stateEvent = event.conversation.kind === "group" && this.#sharedConversationState
         ? this.#sharedConversationState.mapEvent(event)
@@ -1014,13 +989,14 @@ export class GroupAgentCore {
       const stateStore = event.conversation.kind === "group" && this.#sharedConversationState
         ? this.#sharedConversationState.store
         : this.#store;
+      const memoryQuery = buildMemoryRetrievalQuery(event, recentMessages);
       const memories = digestTurn ? [] : await this.#findRelevantMemories(
         event,
         stateStore,
         stateEvent.conversation.id,
         stateEvent.sender.id,
-        event.text,
-        this.#memoryLimit,
+        memoryQuery,
+        fastTurn ? Math.min(this.#memoryLimit, 4) : this.#memoryLimit,
       );
       const members = stateStore.listMembers(stateEvent.conversation.id).map((member) => ({
         ...member,
@@ -1029,9 +1005,11 @@ export class GroupAgentCore {
       const behaviors = stateStore.getBehaviorRules(
         stateEvent.conversation.id,
         stateEvent.sender.id,
-        this.#behaviorLimit,
+        fastTurn ? Math.min(this.#behaviorLimit, 4) : this.#behaviorLimit,
       );
-      const preverifiedKnowledge = await this.#autoLookupKnowledge(stateEvent, recentMessages, triggerReason);
+      const preverifiedKnowledge = fastTurn
+        ? undefined
+        : await this.#autoLookupKnowledge(stateEvent, recentMessages, triggerReason);
       const stagedParts: MessagePart[] = [];
       let tools = createCoreTools({
         store: stateStore,
@@ -1069,15 +1047,25 @@ export class GroupAgentCore {
         });
         if (imageTool) tools.push(imageTool);
       }
+      const imageUnderstandingAvailable = tools.some((tool) => tool.name === "understand_image");
       if (context.mediaResolver) {
-        const attachmentTool = createAttachmentInspectionTool({ event, mediaResolver: context.mediaResolver });
+        const attachmentParts = attachmentPartsForEvent(this.#store, event);
+        const attachmentEvent = attachmentParts.length > 0 ? { ...event, parts: attachmentParts } : event;
+        const attachmentTool = createAttachmentInspectionTool({ event: attachmentEvent, mediaResolver: context.mediaResolver });
         if (attachmentTool) tools.push(attachmentTool);
       }
-      appendProvidedTools(tools, this.#toolProviders, event, (part) => {
+      appendProvidedTools(tools, this.#toolProviders, event, this.#store, (part) => {
         if (stagedParts.length >= 20) throw new Error("A turn cannot stage more than 20 outbound message parts");
         validateMessageParts([part]);
         stagedParts.push(part);
-      });
+      }, context, fastTurn);
+      if (fastTurn) {
+        const fastToolNames = new Set(["memory", "behavior", "recall_history", "synthesize_speech"]);
+        if (event.conversation.kind === "group" && !requiresExplicitGroupReply(event, triggerReason)) {
+          fastToolNames.add("skip_reply");
+        }
+        tools = tools.filter((tool) => fastToolNames.has(tool.name));
+      }
       if (event.metadata?.proactiveKind !== undefined) {
         // Scheduled/plugin participation is text-only unless a future request
         // type explicitly models an approved output modality. Tool prose is not
@@ -1114,11 +1102,27 @@ export class GroupAgentCore {
         knowledgeAvailable: this.#knowledgeRetriever !== undefined,
         ...(preverifiedKnowledge ? { preverifiedKnowledge } : {}),
         emojiAvailable: tools.some((tool) => tool.name === "send_emoji"),
+        imageSendingAvailable: tools.some((tool) => tool.name === "generate_image" || tool.name === "download_image"),
+        imageUnderstandingAvailable,
         recentReplyStyle: recentReplyStyleFingerprint(recentMessages),
         ...(voiceReplyMode ? { voiceReplyMode } : {}),
       });
       const emojiTool = tools.find((tool) => tool.name === "send_emoji");
       const emojiRecommendation = emojiTool ? emojiToolRecommendation(emojiTool) : undefined;
+      let toolCallFeedbackSent = false;
+      const onToolCallStart = this.#toolCallFeedback
+        ? ({ toolName, args, modelText }: AgentToolCallStart) => {
+            if (toolCallFeedbackSent || !isLongRunningAgentTool(toolName)) return;
+            toolCallFeedbackSent = true;
+            this.#toolCallFeedback?.({
+              event,
+              triggerReason,
+              toolName,
+              args,
+              ...(modelText ? { modelText } : {}),
+            });
+          }
+        : undefined;
       const result: AgentRunResult = triggerReason === "ambient-emoji-battle" && !semanticEmojiBattle
         ? { text: "" }
         : await runner.run({
@@ -1133,6 +1137,7 @@ export class GroupAgentCore {
               maxToolCalls: this.#maxAgentToolCalls,
               timeoutMs: this.#agentTimeoutMs,
             },
+            ...(onToolCallStart ? { onToolCallStart } : {}),
           });
       let guarded = guardAgentText(result.text, event.text);
       if (guarded.blocked) {
@@ -1236,8 +1241,6 @@ export class GroupAgentCore {
         }
       }
       throw error;
-    } finally {
-      stopPendingFeedback?.();
     }
   }
 
@@ -1258,11 +1261,12 @@ export class GroupAgentCore {
     );
     const action = result.actions[0];
     if (action) {
+      const historyText = text || renderMessageParts(parts, true).join("\n");
       this.#sharedConversationState?.appendOutbound(
         event,
         activeBot,
         action.id,
-        text,
+        historyText,
         action.createdAt,
       );
     }
@@ -1348,7 +1352,7 @@ export class GroupAgentCore {
       if (items.length === 0) return "自动查证未找到结果；不要仅凭旧知识给出确定结论，可继续调用 lookup_knowledge 精确搜索。";
       const text = items.slice(0, 5).map((item, index) => {
         const source = item.source ? ` | 来源: ${item.source}` : "";
-        const updated = item.updatedAt ? ` | 时间: ${new Date(item.updatedAt).toISOString()}` : "";
+        const updated = item.updatedAt ? ` | 时间: ${formatBeijingTimestamp(item.updatedAt)}` : "";
         return `[${index + 1}] ${item.title}${source}${updated}\n${item.content}`;
       }).join("\n\n");
       return text.length <= this.#maxKnowledgeChars ? text : `${text.slice(0, this.#maxKnowledgeChars)}\n[证据已截断]`;
@@ -1414,7 +1418,11 @@ function collectAvailableImages(
   if (current.length + referenced.length >= maxImages) {
     return [...referenced.slice(-(maxImages - current.length)), ...current];
   }
-  if (current.length === 0 && referenced.length === 0 && !referencesVisualContext(event.text)) return [];
+  const implicitRecentImage = current.length === 0 &&
+    referenced.length === 0 &&
+    referencesImplicitVisualContext(event.text) &&
+    hasImmediateRecentImage(store, event, recentMessages, messageLimit, windowMs);
+  if (current.length === 0 && referenced.length === 0 && !referencesVisualContext(event.text) && !implicitRecentImage) return [];
   if (messageLimit === 0 || windowMs === 0) return [...referenced, ...current];
 
   const recent = recentMessages.slice(-messageLimit);
@@ -1449,11 +1457,60 @@ function inboundImagesForMessage(
   sourceEventId: string,
   transportMessageId?: string,
 ): ReturnType<SqliteStore["getInboundImages"]> {
+  const pending = [sourceEventId];
   if (transportMessageId) {
-    const local = store.getInboundImagesByTransportMessageId(conversationId, transportMessageId);
-    if (local.length > 0) return local;
+    const local = store.getInboundMessageByTransportMessageId(conversationId, transportMessageId);
+    if (local?.id) pending.push(local.id);
   }
-  return store.getInboundImages(sourceEventId);
+  const visited = new Set<string>();
+  while (pending.length > 0 && visited.size < 4) {
+    const eventId = pending.shift();
+    if (!eventId || visited.has(eventId)) continue;
+    visited.add(eventId);
+    const message = store.getInboundMessage(eventId);
+    if (!message || message.conversation.id !== conversationId) continue;
+    const direct = store.getInboundImages(eventId);
+    if (direct.length > 0) return direct;
+    if (message.replyTo?.messageId) pending.push(message.replyTo.messageId);
+    if (message.replyTo?.transportMessageId) {
+      const quoted = store.getInboundMessageByTransportMessageId(
+        conversationId,
+        message.replyTo.transportMessageId,
+      );
+      if (quoted?.id) pending.push(quoted.id);
+    }
+    for (const part of message.parts ?? []) {
+      if (part.type === "quote") pending.push(part.messageId);
+    }
+  }
+  return [];
+}
+
+/**
+ * A short text immediately following an image or a quote of an image is
+ * commonly the actual image question (for example, "看看图片"). The text
+ * does not have to carry the attachment itself, so keep the latest referenced
+ * inbound image available for this narrow, bounded continuation case.
+ */
+function hasImmediateRecentImage(
+  store: SqliteStore,
+  event: InboundMessageEvent,
+  recentMessages: StoredMessage[],
+  messageLimit: number,
+  windowMs: number,
+): boolean {
+  if (messageLimit === 0 || windowMs === 0) return false;
+  const latestInbound = [...recentMessages].reverse().find((message) => message.direction === "inbound");
+  if (!latestInbound) return false;
+  const now = event.timestamp ?? Date.now();
+  const age = now - latestInbound.timestamp;
+  if (age < 0 || age > Math.min(windowMs, 5 * 60_000)) return false;
+  return inboundImagesForMessage(
+    store,
+    event.conversation.id,
+    latestInbound.sourceEventId ?? latestInbound.id,
+    latestInbound.transportMessageId,
+  ).length > 0;
 }
 
 function classifyParticipationFeedback(
@@ -1728,6 +1785,25 @@ function fitRecentMessages(messages: StoredMessage[], maxChars: number): StoredM
   return selected.reverse();
 }
 
+/**
+ * Group questions often use short anaphora such as "他之前说什么" or "那个
+ * 人叫什么". Include a small amount of recent inbound context so the local
+ * memory index and semantic index can resolve the entity the user omitted from
+ * the current sentence.
+ */
+function buildMemoryRetrievalQuery(event: InboundMessageEvent, recentMessages: StoredMessage[]): string {
+  const values = [
+    event.text,
+    ...recentMessages
+      .filter((message) => message.direction === "inbound")
+      .slice(-8)
+      .map((message) => message.text.slice(0, 500)),
+  ]
+    .map((value) => value.normalize("NFKC").replace(/\s+/gu, " ").trim())
+    .filter(Boolean);
+  return values.join("；").slice(0, 4_000);
+}
+
 function recentReplyStyleFingerprint(messages: StoredMessage[]): string {
   const replies = messages.filter((message) => message.direction === "outbound").slice(-5);
   if (replies.length === 0) return "近期没有机器人回复样本。";
@@ -1812,6 +1888,12 @@ function referencesVisualContext(value: string): boolean {
   );
 }
 
+function referencesImplicitVisualContext(value: string): boolean {
+  const normalized = value.normalize("NFKC");
+  return /(?:分析|判断|评价|描述|识别|看看|说说|这个|那个|它)/u.test(normalized) ||
+    /(?:我在|我正在|你在|他在|她在|做什么|干什么|干嘛|在干嘛)/u.test(normalized);
+}
+
 function recentConversationThread(
   messages: StoredMessage[],
   botId: string,
@@ -1841,7 +1923,10 @@ function participationJudgeSystemPrompt(intensity: ParticipationIntensity): stri
     : intensity === "active"
       ? "当前为积极档：除了明确追问和纠正，自然延续机器人刚参与的话题、合适的轻松接梗、或能提供实际帮助时也可 speak；但不要打断群友之间的私聊，不要只做无信息量附和。"
       : "当前为标准档：追问、纠正机器人或机器人确实能补充有用新信息时 speak；不确定时 silent。";
-  return `你是群聊接话门控分类器，不负责回答问题。${policy} 只有笑声、感谢、收到、纯附和，群友之间互相对话，明显话题转移，以及机器人只能重复或礼貌应和时选择 silent。confidence 表示分类正确性的把握，不表示接话意愿。只输出一行 JSON，不输出解释、Markdown、代码围栏或工具调用。`;
+  return `你是群聊接话门控分类器，不负责回答问题。${policy} 只有笑声、感谢、收到、纯附和，群友之间互相对话，明显话题转移，以及机器人只能重复或礼貌应和时选择 silent。confidence 表示分类正确性的把握，不表示接话意愿。
+
+固定规则：speak 只能搭配 followup、correction 或 new_info；silent 只能搭配 ack_only、human_to_human、topic_shift、no_value 或 uncertain。不确定当前消息是不是在对机器人说时选择 silent/uncertain；不要因为关键词相似就认定同一话题，要结合说话人和语义关系。
+参考：机器人回答后群友追问属于 followup；群友指出机器人信息有误属于 correction；群友只说“好的谢谢”属于 ack_only；群友改聊晚饭属于 topic_shift。只输出一行 JSON，不输出解释、Markdown、代码围栏或工具调用。`;
 }
 
 function parseConversationJudge(value: string | null): {
@@ -1978,11 +2063,20 @@ function appendProvidedTools(
   tools: AgentRunRequest["tools"],
   providers: readonly AgentToolProvider[],
   event: InboundMessageEvent,
+  store: SqliteStore,
   stagePart: (part: MessagePart) => void,
+  context: AgentReceiveContext,
+  fastTurn: boolean,
 ): void {
   const names = new Set(tools.map((tool) => tool.name));
   for (const provider of providers) {
-    const provided = provider({ event, stagePart });
+    const provided = provider({
+      event,
+      stagePart,
+      store,
+      fastTurn,
+      ...(context.mediaResolver ? { mediaResolver: context.mediaResolver } : {}),
+    });
     if (tools.length + provided.length > 64) throw new Error("A turn cannot expose more than 64 tools");
     for (const tool of provided) {
       if (!tool.name.trim()) throw new Error("Provided Agent tool name cannot be empty");
@@ -1991,4 +2085,17 @@ function appendProvidedTools(
       tools.push(tool);
     }
   }
+}
+
+const SHORT_AGENT_TOOLS = new Set([
+  "memory",
+  "behavior",
+  "recall_history",
+  "skip_reply",
+  "search_emojis",
+  "send_emoji",
+]);
+
+function isLongRunningAgentTool(toolName: string): boolean {
+  return !SHORT_AGENT_TOOLS.has(toolName);
 }

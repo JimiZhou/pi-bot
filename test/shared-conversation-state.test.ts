@@ -29,6 +29,24 @@ test("shared state preserves opaque transport identities without format guessing
   }
 });
 
+test("shared state can canonicalize adapter-prefixed rooms and members for fusion", () => {
+  const state = new SharedConversationState(":memory:", {
+    conversationIdResolver: (value) => value.normalize("NFKC").trim().toLocaleLowerCase().split(":").at(-1) ?? value,
+    identityIdResolver: (value) => value.normalize("NFKC").trim().toLocaleLowerCase().split(":").at(-1) ?? value,
+  });
+  try {
+    const mapped = state.mapEvent({
+      ...event("adapter-a:event-1"),
+      conversation: { id: "adapter:room@chatroom", kind: "group" },
+      sender: { id: "adapter:member-1", displayName: "成员一" },
+    });
+    assert.equal(mapped.conversation.id, "room@chatroom");
+    assert.equal(mapped.sender.id, "member-1");
+  } finally {
+    state.close();
+  }
+});
+
 test("an explicit transport message id fuses events observed by different adapters", () => {
   const state = new SharedConversationState(":memory:");
   try {

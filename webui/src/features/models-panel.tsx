@@ -4,6 +4,7 @@ import {
   CircleAlert,
   Cloud,
   Cpu,
+  ExternalLink,
   Gauge,
   MoreHorizontal,
   Route,
@@ -76,8 +77,11 @@ export function ModelsPanel({ routes, providers }: { routes: ModelRoute[]; provi
                       </Button>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end">
-                      <DropdownMenuItem>编辑路由</DropdownMenuItem>
-                      <DropdownMenuItem>查看请求日志</DropdownMenuItem>
+                      <DropdownMenuItem asChild>
+                        <a href="#models">
+                          <ExternalLink /> 在模型模块管理
+                        </a>
+                      </DropdownMenuItem>
                     </DropdownMenuContent>
                   </DropdownMenu>
                 </CardAction>
@@ -126,7 +130,9 @@ export function ModelsPanel({ routes, providers }: { routes: ModelRoute[]; provi
           <CardTitle>模型服务连接</CardTitle>
           <CardDescription>兼容原生接口与通用协议的模型服务</CardDescription>
           <CardAction>
-            <Button variant="outline" size="sm">添加连接</Button>
+            <Button variant="outline" size="sm" asChild>
+              <a href="#providers">管理连接</a>
+            </Button>
           </CardAction>
         </CardHeader>
         <CardContent className="px-0">
@@ -168,8 +174,10 @@ export function ModelsPanel({ routes, providers }: { routes: ModelRoute[]; provi
                       />
                     </TableCell>
                     <TableCell>
-                      <Button variant="ghost" size="icon-sm" aria-label={`${provider.name}设置`}>
-                        {provider.status === "需关注" ? <CircleAlert /> : <Route />}
+                      <Button variant="ghost" size="icon-sm" aria-label={`${provider.name}设置`} asChild>
+                        <a href="#models">
+                          {provider.status === "需关注" ? <CircleAlert /> : <Route />}
+                        </a>
                       </Button>
                     </TableCell>
                   </TableRow>

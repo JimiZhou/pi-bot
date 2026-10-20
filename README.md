@@ -35,7 +35,47 @@ GroupAgentCore → Pi Agent → durable outbox
 ```bash
 npm ci
 npm run check
+npm start
 ```
+
+首次启动会在 `data/admin-token.txt` 生成 WebUI 管理令牌，打开
+`http://127.0.0.1:8787/` 后输入令牌即可。也可以通过 `PI_ADMIN_TOKEN` 固定令牌。
+
+### v0.3 开箱配置
+
+仓库现在包含可直接运行的 Core、ChannelRuntime、Admin API 和 React WebUI，但不捆绑任何聊天平台客户端。没有外部 Adapter 时，Bot 可以创建和配置，但启用后会提示通道未注册；这是有意保留的接入边界。
+
+通过 `PI_CHANNEL_ADAPTER_MODULE` 加载你自己的 ES Module：
+
+```bash
+PI_CHANNEL_ADAPTER_MODULE=./adapters/example-adapter.mjs npm start
+```
+
+模块需要导出 `adapter`（或 `adapters` 数组），每个 Adapter 提供 `manifest.type` 和 `create(context)`。`create()` 返回的插件负责：
+
+- 登录、扫码、cookie、签名和平台 SDK 生命周期；
+- 把平台事件转换成 `ChannelPlugin` 的标准入站事件；
+- 把 Core 的文本、媒体、引用、提及和语音动作转换成平台发送 API；
+- 媒体下载/上传、资产解析、健康检查、回调注册和平台特有管理能力。
+
+wxhook、iPad 协议客户端、账号登录服务、平台凭据和平台特有群管理都需要用户在仓库外自行实现；本仓库不会读取或保存这些协议字段。
+
+Docker 用户可以直接运行 `docker compose up --build`。Compose 会把本地 `./adapters` 只读挂载到容器的 `/app/adapters`；如果设置 `PI_CHANNEL_ADAPTER_MODULE=./adapters/your-adapter.mjs`，即可在容器启动时加载它。
+
+### v0.3 能力
+
+- 多模型 Provider、主模型/备用模型链、视觉理解、语音转写与 TTS。
+- 对话历史、长期记忆、行为学习、群聊参与判断、主动参与和定时任务。
+- 插件目录、MCP、知识检索、表情库、自定义 meme 和 meme-generator 集成。
+- 入站幂等、同会话串行、可靠 outbox、媒体资产隔离、审计日志和 Admin WebUI。
+
+## 表情包插件
+
+仓库内置了 `meme-generator` 插件，所有没有显式配置的 Bot 默认启用；仍可在插件管理页或群聊设置中关闭。启用后可发送 `meme 中文名称 [文字1 | 文字2]`；只发送 `meme 摸摸` 会先返回动态示例，回复或附上一张图片后再次发送即可生成你的版本，也支持英文 key（`meme petpet`）和 `@Bot meme 摸摸`。插件会按上游模板详情预先校验图片、文字数量，不符合要求时不会请求上游。发送 `meme 菜单` 查看按输入类型整理的中文名称，`meme 详情 中文名称` 查看所需图片和文字数量；菜单支持分页。
+
+Docker Compose 已包含上游 `meetwq/meme-generator` 服务，插件默认通过 `http://meme-generator:2233` 调用；发送前默认将结果压缩到 8 MB 以内，超大 GIF 会降低帧率、尺寸和色彩数，最终由外部 Adapter 负责转换成目标平台支持的消息格式。WebUI 的“表情包”模块中可以刷新模板列表、查看图片/文字参数、生成预览、保存到选定 Bot 的表情库，或发送到选定群聊；WebUI 发送同样会先压缩。可在插件设置 JSON 中用 `maxSendMb` 调整命令发送上限，也可以填写 `apiBaseUrl` 或用 `PI_MEME_API_BASE_URL` 覆盖地址。上游项目的 API 约定见 [meme-generator Wiki](https://github.com/MemeCrafters/meme-generator/wiki/%E9%80%9A%E8%BF%87-api-%E6%96%B9%E5%BC%8F%E8%B0%83%E7%94%A8)。
+
+在 WebUI 的表情包模块可以直接上传 JPEG、PNG、GIF 或 WebP 图片，填写 key、标题和关键词；上传后会立即出现在模板列表，无需进入容器或重启服务。这类自定义图片 meme 直接使用原图，不需要额外文字或输入图片。需要上游 Python 模板能力时，仍可把模板放在 `data/meme-generator/memes/<your-key>/`，按上游格式提供 `__init__.py` 和素材文件并重启 `meme-generator` 服务；编写格式参考 [新表情编写指北](https://github.com/MemeCrafters/meme-generator/wiki/%E6%96%B0%E8%A1%A8%E6%83%85%E7BC%96%E5%86%99%E6%8C%87%E5%8C%97)。
 
 ## 最小用法
 

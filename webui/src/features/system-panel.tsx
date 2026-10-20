@@ -7,23 +7,11 @@ import {
   HardDrive,
   KeyRound,
   RefreshCw,
-  RotateCcw,
   ServerCog,
   ShieldCheck,
 } from "lucide-react"
 
 import { PageHeader, StatusPill } from "@/components/console-primitives"
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from "@/components/ui/alert-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -55,36 +43,11 @@ const runtimeItems = [
 ] as const
 
 const apiResources = [
-  { resource: "/v1/status", method: "GET", description: "运行状态与健康摘要" },
-  { resource: "/v1/bots", method: "GET · POST", description: "Bot 实例与编排配置" },
-  { resource: "/v1/adapters", method: "GET · POST", description: "适配器注册与能力声明" },
-  { resource: "/v1/sessions", method: "GET", description: "会话索引与上下文状态" },
+  { resource: "/api/status", method: "GET", description: "运行状态与健康摘要" },
+  { resource: "/api/bots", method: "GET", description: "Bot 实例与编排配置" },
+  { resource: "/api/adapters", method: "GET", description: "适配器注册与能力声明" },
+  { resource: "/api/chatrooms", method: "GET", description: "会话索引、群配置与上下文状态" },
 ]
-
-function RestartControl() {
-  return (
-    <AlertDialog>
-      <AlertDialogTrigger asChild>
-        <Button variant="outline">
-          <RotateCcw data-icon="inline-start" />
-          重启服务
-        </Button>
-      </AlertDialogTrigger>
-      <AlertDialogContent>
-        <AlertDialogHeader>
-          <AlertDialogTitle>确认重启核心服务？</AlertDialogTitle>
-          <AlertDialogDescription>
-            当前会话会短暂进入等待状态，服务恢复后将继续处理队列中的事件。
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <AlertDialogFooter>
-          <AlertDialogCancel>取消</AlertDialogCancel>
-          <AlertDialogAction>确认重启</AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
-  )
-}
 
 export function SystemPanel({ runtime, checks }: { runtime: RuntimeInfo; checks: SystemCheck[] }) {
   return (
@@ -93,7 +56,6 @@ export function SystemPanel({ runtime, checks }: { runtime: RuntimeInfo; checks:
         eyebrow="系统"
         title="运行、存储与管理接口"
         description="查看核心服务健康状态、版本信息和平台中性的管理 API。"
-        action={<RestartControl />}
       />
 
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
@@ -123,9 +85,9 @@ export function SystemPanel({ runtime, checks }: { runtime: RuntimeInfo; checks:
             <CardTitle>健康检查</CardTitle>
             <CardDescription>最近一次自动检查：刚刚</CardDescription>
             <CardAction>
-              <Button variant="outline" size="sm">
+              <Button variant="outline" size="sm" disabled>
                 <RefreshCw data-icon="inline-start" />
-                立即检查
+                随页面刷新
               </Button>
             </CardAction>
           </CardHeader>

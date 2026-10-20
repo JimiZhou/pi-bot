@@ -178,6 +178,7 @@ interface ParticipationCaseRow {
 
 export class SqliteStore {
   readonly #database: DatabaseSync;
+  #closed = false;
 
   constructor(path: string, options: SqliteStoreOptions = {}) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
@@ -195,7 +196,26 @@ export class SqliteStore {
   }
 
   close(): void {
+    this.#closed = true;
     this.#database.close();
+  }
+
+  /**
+   * Outbound replies are already durable in the messages/outbox transaction.
+   * Their search terms can be indexed after the channel has started delivery;
+   * keeping that secondary index off the reply critical path matters on large
+   * long-lived SQLite files.
+   */
+  deferMessageIndex(sequence: number, text: string): void {
+    if (this.#closed) return;
+    setImmediate(() => {
+      if (this.#closed) return;
+      try {
+        this.#transaction(() => this.#indexMessage(sequence, text));
+      } catch {
+        // Search indexing is best effort; the durable message remains intact.
+      }
+    });
   }
 
   ingest(event: InboundMessageEvent): { inserted: boolean; status: InboxRow["status"] } {
@@ -324,6 +344,7 @@ export class SqliteStore {
     const normalizedParts = parts.length > 0 ? parts : [textPart(text)];
     let action!: OutboundMessageAction;
 
+    let messageSequence = 0;
     this.#transaction(() => {
       const result = this.#database
         .prepare(
@@ -332,7 +353,7 @@ export class SqliteStore {
            VALUES (?, ?, 'outbound', ?, ?, ?, ?, ?, ?)`,
         )
         .run(messageId, event.conversation.id, botId, botName, text, now, event.id, event.id);
-      this.#indexMessage(Number(result.lastInsertRowid), text);
+      messageSequence = Number(result.lastInsertRowid);
 
       this.#database
         .prepare(
@@ -360,6 +381,8 @@ export class SqliteStore {
         createdAt: now,
       };
     });
+
+    this.deferMessageIndex(messageSequence, text);
 
     return { eventId: event.id, status: "replied", triggerReason: reason, actions: [action], replayed: false };
   }
@@ -826,33 +849,61 @@ export class SqliteStore {
     timestamp: number;
     part: Extract<MessagePart, { type: "image" }>;
   }> {
-    const row = this.#database.prepare("SELECT raw_json FROM inbox WHERE event_id = ?").get(eventId) as
-      | { raw_json: string }
-      | undefined;
-    if (!row) return [];
+    const value = this.getInboundMessage(eventId);
+    if (!value || !Array.isArray(value.parts)) return [];
     try {
-      const value = JSON.parse(row.raw_json) as Partial<InboundMessageEvent>;
-      if (
-        value.type !== "message" ||
-        value.id !== eventId ||
-        !value.sender?.id ||
-        !Array.isArray(value.parts)
-      ) {
-        return [];
-      }
       const parts = value.parts.filter(
         (part): part is Extract<MessagePart, { type: "image" }> => part.type === "image",
       );
       validateMessageParts(parts);
       return parts.map((part) => ({
         messageId: eventId,
-        senderId: value.sender!.id,
+        senderId: value.sender.id,
         timestamp: value.timestamp ?? 0,
         part,
       }));
     } catch {
       return [];
     }
+  }
+
+  /** Returns the original inbound event, including binary attachment metadata. */
+  getInboundMessage(eventId: string): InboundMessageEvent | undefined {
+    const row = this.#database.prepare("SELECT raw_json FROM inbox WHERE event_id = ?").get(eventId) as
+      | { raw_json: string }
+      | undefined;
+    if (!row) return undefined;
+    try {
+      const value = JSON.parse(row.raw_json) as Partial<InboundMessageEvent>;
+      if (
+        value.type !== "message" ||
+        value.id !== eventId ||
+        !value.conversation?.id ||
+        !value.sender?.id ||
+        typeof value.text !== "string"
+      ) {
+        return undefined;
+      }
+      if (value.parts !== undefined) {
+        if (!Array.isArray(value.parts)) return undefined;
+        validateMessageParts(value.parts);
+      }
+      return value as InboundMessageEvent;
+    } catch {
+      return undefined;
+    }
+  }
+
+  getInboundMessageByTransportMessageId(
+    conversationId: string,
+    transportMessageId: string,
+  ): InboundMessageEvent | undefined {
+    const row = this.#database.prepare(
+      `SELECT id FROM messages
+       WHERE conversation_id = ? AND direction = 'inbound' AND transport_message_id = ?
+       ORDER BY sequence DESC LIMIT 1`,
+    ).get(conversationId, transportMessageId) as { id: string } | undefined;
+    return row ? this.getInboundMessage(row.id) : undefined;
   }
 
   getInboundImagesByTransportMessageId(

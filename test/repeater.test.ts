@@ -19,6 +19,16 @@ test("repeater joins after two different people repeat text but ignores one-pers
   })), undefined);
 });
 
+test("repeater treats sender ids that differ only by case as the same person", async (context) => {
+  const fixture = createRepeaterFixture(context);
+  await fixture.core.receiveIgnored(message("repeat-case-1", "account:villaEason", "Sao", "这一餐多少"), "seed");
+
+  assert.equal(
+    fixture.plugin.handleInbound(message("repeat-case-2", "account:villaeason", "Sao", "这一餐多少")),
+    undefined,
+  );
+});
+
 test("repeater preserves a normalized emoji part so animation metadata is retained", async (context) => {
   const fixture = createRepeaterFixture(context);
   const first = emojiMessage("emoji-1", "member-a", "甲");

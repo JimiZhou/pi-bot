@@ -109,6 +109,96 @@ test("Pi executes a learning tool before producing the final chat reply", async 
   }
 });
 
+test("Pi gives image understanding enough time to reach its provider fallback", async () => {
+  const faux = registerFauxProvider({ provider: uniqueProvider() });
+  const Parameters = Type.Object({ imageIndex: Type.Integer(), question: Type.String() });
+  const imageTool: AgentTool<typeof Parameters, { inspected: true }> = {
+    name: "understand_image",
+    label: "查看图片",
+    description: "查看图片细节",
+    parameters: Parameters,
+    async execute(): Promise<AgentToolResult<{ inspected: true }>> {
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      return { content: [{ type: "text", text: "视觉证据" }], details: { inspected: true } };
+    },
+  };
+
+  try {
+    faux.setResponses([
+      fauxAssistantMessage(
+        fauxToolCall("understand_image", { imageIndex: 1, question: "图里是什么？" }),
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage("看到了图片内容。"),
+    ]);
+    const runner = new PiAgentRunner({
+      model: faux.getModel(),
+      thinkingLevel: "off",
+      attemptTimeoutMs: 1_000,
+    });
+    const result = await runner.run({
+      systemPrompt: "system",
+      prompt: "看看图",
+      sessionId: "image-tool-timeout",
+      tools: [imageTool],
+      budget: { maxLlmCalls: 2, maxToolCalls: 2, timeoutMs: 5_000 },
+    });
+    assert.equal(result.text, "看到了图片内容。");
+    assert.equal(result.telemetry?.toolCalls, 1);
+  } finally {
+    faux.unregister();
+  }
+});
+
+test("Pi can move to the next model when the read-only image tool times out", async () => {
+  const faux = registerFauxProvider({ provider: uniqueProvider() });
+  const Parameters = Type.Object({ imageIndex: Type.Integer(), question: Type.String() });
+  const imageTool: AgentTool<typeof Parameters, Record<string, never>> = {
+    name: "understand_image",
+    label: "查看图片",
+    description: "查看图片细节",
+    parameters: Parameters,
+    async execute(): Promise<AgentToolResult<Record<string, never>>> {
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      return { content: [{ type: "text", text: "视觉证据" }], details: {} };
+    },
+  };
+
+  try {
+    faux.setResponses([
+      fauxAssistantMessage(
+        fauxToolCall("understand_image", { imageIndex: 1, question: "图里是什么？" }),
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage("", { stopReason: "error", errorMessage: "HTTP 500 vision provider failed" }),
+    ]);
+    const fallbackRequests: string[] = [];
+    const runner = new PiAgentRunner({
+      model: faux.getModel(),
+      thinkingLevel: "off",
+      attemptTimeoutMs: 1_000,
+      retryDelaysMs: [],
+      fallbackRunner: {
+        async run(request) {
+          fallbackRequests.push(request.prompt);
+          return { text: "备用模型继续处理图片。" };
+        },
+      },
+    });
+    const result = await runner.run({
+      systemPrompt: "system",
+      prompt: "看看图",
+      sessionId: "image-tool-fallback",
+      tools: [imageTool],
+      budget: { maxLlmCalls: 3, maxToolCalls: 2, timeoutMs: 5_000 },
+    });
+    assert.equal(result.text, "备用模型继续处理图片。");
+    assert.equal(fallbackRequests.length, 1);
+  } finally {
+    faux.unregister();
+  }
+});
+
 test("Pi retries transient upstream 500 failures before returning a reply", async () => {
   const faux = registerFauxProvider({ provider: uniqueProvider() });
   try {

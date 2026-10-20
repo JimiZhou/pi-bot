@@ -15,9 +15,13 @@ import type {
  */
 export class SharedConversationState {
   readonly store: SqliteStore;
+  readonly #conversationIdResolver: (value: string) => string;
+  readonly #identityIdResolver: (value: string) => string;
 
-  constructor(databasePath: string) {
+  constructor(databasePath: string, options: SharedConversationStateOptions = {}) {
     this.store = new SqliteStore(databasePath);
+    this.#conversationIdResolver = options.conversationIdResolver ?? identity;
+    this.#identityIdResolver = options.identityIdResolver ?? identity;
   }
 
   close(): void {
@@ -25,7 +29,7 @@ export class SharedConversationState {
   }
 
   hasConversation(conversationId: string): boolean {
-    return this.store.getRecent(conversationId, 1).length > 0;
+    return this.store.getRecent(this.#conversationIdResolver(conversationId), 1).length > 0;
   }
 
   prepareInbound(event: InboundMessageEvent): InboundMessageEvent | undefined {
@@ -39,7 +43,8 @@ export class SharedConversationState {
 
   mapEvent(event: InboundMessageEvent): InboundMessageEvent {
     if (event.conversation.kind !== "group") return event;
-    const conversationId = event.conversation.id;
+    const conversationId = this.#conversationIdResolver(event.conversation.id);
+    const senderId = this.#identityIdResolver(event.sender.id);
     return {
       ...event,
       id: fusedMessageId({
@@ -57,11 +62,11 @@ export class SharedConversationState {
       },
       sender: {
         ...event.sender,
-        id: event.sender.id,
-        displayName: safeGroupDisplayName(event.sender.displayName, event.sender.id),
+        id: senderId,
+        displayName: safeGroupDisplayName(event.sender.displayName, senderId),
       },
       ...(event.mentions
-        ? { mentions: event.mentions.map((mention) => ({ ...mention })) }
+        ? { mentions: event.mentions.map((mention) => ({ ...mention, id: this.#identityIdResolver(mention.id) })) }
         : {}),
       ...(event.replyTo
         ? {
@@ -72,7 +77,7 @@ export class SharedConversationState {
                 event.replyTo.messageId,
                 event.replyTo.transportMessageId,
               ),
-              ...(event.replyTo.senderId ? { senderId: event.replyTo.senderId } : {}),
+              ...(event.replyTo.senderId ? { senderId: this.#identityIdResolver(event.replyTo.senderId) } : {}),
             },
           }
         : {}),
@@ -83,15 +88,15 @@ export class SharedConversationState {
     const mapped = this.mapEvent(event);
     return this.#forBot(
       this.store.getRecentBefore(mapped.conversation.id, mapped.id, limit),
-      event.conversation.id,
+      mapped.conversation.id,
       bot,
     );
   }
 
   recent(conversationId: string, limit: number, bot: BotIdentity): StoredMessage[] {
     return this.#forBot(
-      this.store.getRecent(conversationId, limit),
-      conversationId,
+      this.store.getRecent(this.#conversationIdResolver(conversationId), limit),
+      this.#conversationIdResolver(conversationId),
       bot,
     );
   }
@@ -104,8 +109,8 @@ export class SharedConversationState {
     timestamp = Date.now(),
   ): boolean {
     if (event.conversation.kind !== "group") return false;
-    const conversationId = event.conversation.id;
     const mappedInbound = this.mapEvent(event);
+    const conversationId = mappedInbound.conversation.id;
     return this.store.appendExternalMessage({
       id: fusedMessageId({
         sourceId: sourceMessageId,
@@ -163,8 +168,8 @@ export class SharedConversationState {
   }
 
   importMemory(memory: MemoryRecord): MemoryRecord {
-    const conversationId = memory.conversationId ?? memory.scopeId;
-    const scopeId = memory.scope === "conversation" ? conversationId : memory.scopeId;
+    const conversationId = this.#conversationIdResolver(memory.conversationId ?? memory.scopeId);
+    const scopeId = memory.scope === "conversation" ? conversationId : this.#identityIdResolver(memory.scopeId);
     return this.store.remember({
       scope: memory.scope,
       scopeId,
@@ -178,10 +183,10 @@ export class SharedConversationState {
   }
 
   importBehavior(rule: BehaviorRule): BehaviorRule {
-    const conversationId = rule.conversationId;
+    const conversationId = this.#conversationIdResolver(rule.conversationId);
     return this.store.setBehavior({
       scope: rule.scope,
-      scopeId: rule.scope === "conversation" ? conversationId : rule.scopeId,
+      scopeId: rule.scope === "conversation" ? conversationId : this.#identityIdResolver(rule.scopeId),
       conversationId,
       rule: rule.rule,
       actorId: "system:failover-import",
@@ -194,11 +199,11 @@ export class SharedConversationState {
     actorId: string,
     sourceEventId: string,
   ) {
-    return this.store.resetConversationContext(conversationId, actorId, sourceEventId);
+    return this.store.resetConversationContext(this.#conversationIdResolver(conversationId), this.#identityIdResolver(actorId), sourceEventId);
   }
 
   contextReset(conversationId: string) {
-    return this.store.getConversationContextReset(conversationId);
+    return this.store.getConversationContextReset(this.#conversationIdResolver(conversationId));
   }
 
   #forBot(messages: StoredMessage[], conversationId: string, bot: BotIdentity): StoredMessage[] {
@@ -208,11 +213,23 @@ export class SharedConversationState {
       ...(message.direction === "outbound"
         ? { senderId: bot.id, senderName: bot.displayName }
         : {
+            senderId: this.#identityIdResolver(message.senderId),
             senderName: safeGroupDisplayName(message.senderName, message.senderId),
             text: replaceTransportIds(message.text),
           }),
     }));
   }
+}
+
+export interface SharedConversationStateOptions {
+  /** Maps adapter-specific room ids to the bot-independent room id. */
+  conversationIdResolver?: (value: string) => string;
+  /** Maps adapter-specific member ids to the bot-independent member id. */
+  identityIdResolver?: (value: string) => string;
+}
+
+function identity(value: string): string {
+  return value.normalize("NFKC").trim();
 }
 
 export function fusedMessageId(input: {

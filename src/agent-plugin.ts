@@ -2,6 +2,7 @@ import type { ChannelInboundAction, ChannelRuntime } from "./channel.js";
 import type { GroupAgentCore } from "./core.js";
 import type { BotPluginConfig, PersonaProfile } from "./config.js";
 import type { InboundMessageEvent } from "./types.js";
+import type { AssetStore } from "./asset-store.js";
 import type { ScheduledTaskRepository } from "./scheduled-task.js";
 import type { ConversationContextReset } from "./sqlite-store.js";
 import type { ConversationVoiceMode } from "./reply-modality.js";
@@ -49,9 +50,13 @@ export interface AgentPluginContext {
   botId: string;
   identityId: string;
   identityAliases?(conversationId: string): string[];
+  /** Returns the bot that owns direct plugin replies for a shared group. */
+  preferredGroupBotId?(conversationId: string): string | undefined;
   timezoneOffsetMinutes: number;
   core: GroupAgentCore;
   runtime: ChannelRuntime;
+  /** Bot-owned local media storage for plugin-generated outbound assets. */
+  assets?: AssetStore;
   scheduledTasks?: ScheduledTaskRepository;
   personas?: {
     list(): PersonaProfile[];

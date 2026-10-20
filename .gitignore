@@ -1,6 +1,10 @@
 node_modules/
-dist/
-data/
+.env
+/data/
+/data.generated-*/
+/deployment-backups/
+/dist/
+webui/dist/
 runtime/
 artifacts/
 .remote-*/
@@ -9,5 +13,7 @@ coverage/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
-.env
+*.tsbuildinfo
+/*.png
+/*.svg
 *.log

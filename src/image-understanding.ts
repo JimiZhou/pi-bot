@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import {
   completeSimple,
@@ -137,6 +138,7 @@ export interface PiImageUnderstandingProviderOptions {
   apiKey?: string | ((provider: string) => string | undefined | Promise<string | undefined>);
   thinkingLevel?: ThinkingLevel;
   maxTokens?: number;
+  maxImageBytes?: number;
   timeoutMs?: number;
   maxRetryDelayMs?: number;
   systemPrompt?: string;
@@ -151,14 +153,27 @@ export class PiImageUnderstandingProvider implements ImageUnderstandingProvider 
       throw new Error(`Vision model ${options.model.provider}/${options.model.id} does not accept image input`);
     }
     boundedInteger(options.maxTokens ?? 800, 1, 32_000, "maxTokens");
+    boundedInteger(options.maxImageBytes ?? 10 * 1024 * 1024, 1, 100 * 1024 * 1024, "maxImageBytes");
     boundedInteger(options.timeoutMs ?? 45_000, 1, 10 * 60_000, "timeoutMs");
     if (options.maxRetryDelayMs !== undefined) {
       boundedInteger(options.maxRetryDelayMs, 0, 10 * 60_000, "maxRetryDelayMs");
     }
-    this.#options = options;
+    this.#options = {
+      ...options,
+      maxImageBytes: options.maxImageBytes ?? 10 * 1024 * 1024,
+    };
   }
 
   async understand(request: ImageUnderstandingRequest): Promise<ImageUnderstandingResult> {
+    // Some callers (notably automatic emoji analysis and its retry worker)
+    // invoke the provider directly instead of going through the image tool.
+    // Normalize at this final boundary so no Gemini-compatible endpoint ever
+    // receives an animated GIF MIME type.
+    const image = await normalizeImageForVision(
+      request.data,
+      request.mimeType,
+      this.#options.maxImageBytes ?? 10 * 1024 * 1024,
+    );
     const apiKey = await resolveApiKey(this.#options.apiKey, this.#options.model.provider);
     const response = await completeSimple(
       this.#options.model,
@@ -171,10 +186,10 @@ export class PiImageUnderstandingProvider implements ImageUnderstandingProvider 
               {
                 type: "text",
                 text:
-                  "请先形成一份可供后续问题复用的客观图片观察：概括场景、主体、动作、布局、显著细节，完整抄录可辨识文字、代码、数字和界面提示；看不清的部分明确标注。" +
+                  "请先形成一份可供后续问题复用的客观图片观察：概括场景、主体、动作、布局、显著细节，执行 OCR 并完整抄录可辨识文字、代码、数字和界面提示；看不清的部分明确标注。" +
                   `然后重点回答当前问题：${request.question}`,
               },
-              { type: "image", data: Buffer.from(request.data).toString("base64"), mimeType: request.mimeType },
+              { type: "image", data: Buffer.from(image.bytes).toString("base64"), mimeType: image.mimeType },
             ],
             timestamp: Date.now(),
           },
@@ -395,14 +410,109 @@ async function collectVerifiedImage(
     }
   }
 
-  const bytes = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
-  const detectedMime = detectImageMime(bytes);
+  const originalBytes = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+  const detectedMime = detectImageMime(originalBytes);
   if (!detectedMime) throw new Error("Resolved media is not a supported PNG, JPEG, GIF, or WebP image");
   const declaredMime = normalizeMimeType(resolved.asset.mimeType ?? original.mimeType);
   if (declaredMime && declaredMime !== detectedMime) {
     throw new Error(`Resolved image MIME mismatch: declared ${declaredMime}, detected ${detectedMime}`);
   }
-  return { bytes, mimeType: detectedMime, sha256: digest };
+  const normalized = await normalizeImageForVision(originalBytes, detectedMime, maxBytes);
+  return { ...normalized, sha256: digest };
+}
+
+interface NormalizedVisionImage {
+  bytes: Uint8Array;
+  mimeType: string;
+}
+
+/** Ensures every direct provider call uses a MIME type accepted by Gemini. */
+async function normalizeImageForVision(
+  bytes: Uint8Array,
+  mimeType: string | undefined,
+  maxBytes: number,
+): Promise<NormalizedVisionImage> {
+  if (bytes.byteLength === 0) throw new Error("Vision image is empty");
+  if (bytes.byteLength > maxBytes) throw new Error(`Vision image exceeds the configured ${maxBytes} byte limit`);
+  const declaredMime = normalizeMimeType(mimeType);
+  const detectedMime = detectImageMime(bytes);
+  const sourceMime = detectedMime ?? declaredMime;
+  if (!sourceMime) throw new Error("Vision image has no supported MIME type");
+  if (sourceMime === "image/gif") {
+    return {
+      bytes: await convertGifToPng(bytes, maxBytes),
+      mimeType: "image/png",
+    };
+  }
+  return { bytes, mimeType: sourceMime };
+}
+
+/** Gemini accepts GIFs only after they are decoded to a supported still-image format. */
+async function convertGifToPng(bytes: Uint8Array, maxBytes: number): Promise<Uint8Array> {
+  const executable = process.env.PI_FFMPEG_PATH?.trim() || "ffmpeg";
+  const args = [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-nostdin",
+    "-i",
+    "pipe:0",
+    "-frames:v",
+    "1",
+    "-c:v",
+    "apng",
+    "-f",
+    "apng",
+    "pipe:1",
+  ];
+  return await new Promise<Uint8Array>((resolve, reject) => {
+    const child = spawn(executable, args, { stdio: ["pipe", "pipe", "pipe"] });
+    const output: Buffer[] = [];
+    const errors: Buffer[] = [];
+    let outputSize = 0;
+    let settled = false;
+
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      reject(error);
+    };
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      outputSize += chunk.byteLength;
+      if (outputSize > maxBytes) {
+        fail(new Error(`Converted GIF exceeds the configured ${maxBytes} byte limit`));
+        return;
+      }
+      output.push(chunk);
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      if (Buffer.concat(errors).byteLength < 8_192) errors.push(chunk);
+    });
+    child.on("error", (error) => {
+      fail(new Error(`GIF conversion failed: ${error.message}`));
+    });
+    child.on("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      if (code !== 0) {
+        const detail = Buffer.concat(errors).toString("utf8").trim();
+        reject(new Error(`GIF conversion failed${detail ? `: ${detail}` : ` (exit ${code ?? signal ?? "unknown"})`}`));
+        return;
+      }
+      const converted = Buffer.concat(output);
+      if (converted.byteLength === 0) {
+        reject(new Error("GIF conversion returned an empty PNG"));
+        return;
+      }
+      resolve(converted);
+    });
+    child.stdin.on("error", (error) => {
+      if ((error as NodeJS.ErrnoException).code !== "EPIPE") fail(error);
+    });
+    child.stdin.end(bytes);
+  });
 }
 
 function cachedEvidenceResponse(
